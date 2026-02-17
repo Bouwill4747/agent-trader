@@ -129,14 +129,32 @@
 - **Fix**: Added `positions_json` column to portfolio_snapshots table. `save_snapshot()` now serializes all open positions to JSON. `load_from_db()` classmethod reconstructs the full portfolio from the latest snapshot on startup.
 - **Lesson Learned**: For any stateful service that handles money, persistence is a safety requirement, not a feature. Serialize state at every checkpoint and verify you can reconstruct from it.
 
+### BUG-013: FinBERT zero-sentiment — Reddit error discards news articles
+- **Date**: 2026-02-17
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: High
+- **Symptom**: FinBERT sentiment was `+0.000` for every market despite NewsAPI successfully returning 25+ articles per cycle. The entire sentiment signal (30% of blended weight) was dead.
+- **Root Cause**: In `_research_markets()`, news collection and Reddit scraping shared a single `try/except` block. NewsAPI succeeded (fetched articles), but the next line — Reddit PRAW — threw a 401 (no API credentials yet). The `except` handler returned `{"articles": {}, "sentiment": {}}`, discarding all successfully fetched articles. With no articles passed to the signal generator, FinBERT never received any text to score.
+- **Fix**: Separated news and Reddit into independent `try/except` blocks. Each data source now fails independently — a Reddit outage no longer kills news + FinBERT.
+- **Lesson Learned**: Never put independent operations in the same try/except block. This is the "single point of failure" anti-pattern — one flaky dependency (Reddit, which we didn't even have credentials for) silently disabled an unrelated healthy dependency (NewsAPI + FinBERT). Each external call should fail in isolation.
+
+### BUG-014: Gamma API returning resolved markets with active=True
+- **Date**: 2026-02-17
+- **File(s)**: `src/data/polymarket_client.py`, `src/agent/orchestrator.py`
+- **Severity**: High
+- **Symptom**: Only 2 out of 50 markets passed the liquidity filter. The 48 rejected markets were old, resolved markets from 2020-2021 (e.g., "Will Trump win 2020 election?") with `active=True` but `liquidity=0`.
+- **Root Cause**: The Gamma API `active=True` parameter doesn't exclude resolved/closed markets. Without `closed=False`, the API returns historical markets. Without sorting by liquidity, the first 50 results are old high-volume markets with zero current liquidity.
+- **Fix**: Added `closed=False`, `order=liquidity`, `ascending=False` to Gamma API query params. Added price filter in orchestrator to skip markets with YES price <= $0.02 or >= $0.98 (already resolved). Result: 10+ tradeable markets discovered per cycle.
+- **Lesson Learned**: Don't trust API filter parameters to do what their names suggest. Always verify actual responses against your assumptions. The word "active" meant "not archived" to Polymarket, not "currently tradeable" as we assumed.
+
 ---
 
 ## Stats
 
 | Metric | Count |
 |--------|-------|
-| Total bugs | 12 |
+| Total bugs | 14 |
 | Critical | 5 |
-| High | 3 |
+| High | 5 |
 | Medium | 2 |
 | Low | 2 |
