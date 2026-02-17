@@ -164,26 +164,35 @@ class Orchestrator:
             logger.warning("No markets to research")
             return {"articles": {}, "sentiment": {}}
 
+        articles = {}
+        sentiment = {}
+        errors = state.get("errors", [])
+
+        # Fetch news and Reddit independently — one failing shouldn't block the other
         try:
             articles = self.news.get_articles_for_markets(markets)
-            sentiment = self.sentiment.get_sentiment_for_markets(markets)
-
-            total_articles = sum(len(v) for v in articles.values())
-            total_posts = sum(len(v) for v in sentiment.values())
-
-            logger.info(
-                "Collected %d articles and %d Reddit posts for %d markets",
-                total_articles, total_posts, len(markets)
-            )
-
-            return {"articles": articles, "sentiment": sentiment}
-
         except Exception as e:
-            logger.error("Research failed: %s", e)
-            return {
-                "articles": {}, "sentiment": {},
-                "errors": state.get("errors", []) + [str(e)]
-            }
+            logger.error("News collection failed: %s", e)
+            errors.append(str(e))
+
+        try:
+            sentiment = self.sentiment.get_sentiment_for_markets(markets)
+        except Exception as e:
+            logger.error("Reddit collection failed: %s", e)
+            errors.append(str(e))
+
+        total_articles = sum(len(v) for v in articles.values())
+        total_posts = sum(len(v) for v in sentiment.values())
+
+        logger.info(
+            "Collected %d articles and %d Reddit posts for %d markets",
+            total_articles, total_posts, len(markets)
+        )
+
+        result = {"articles": articles, "sentiment": sentiment}
+        if errors:
+            result["errors"] = errors
+        return result
 
     def _generate_signals(self, state: AgentState) -> dict:
         """Node 3: Run FinBERT + Claude analysis, produce trading signals."""
