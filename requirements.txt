@@ -1,0 +1,28 @@
+# Polymarket
+py-clob-client==0.34.5
+httpx==0.28.1
+
+# LLM & Agent
+anthropic==0.79.0
+langgraph==1.0.8
+langchain-anthropic==1.3.3
+langchain-core==1.2.13             # Pinned for CVE-2025-68664 (serialization injection RCE)
+
+# ML & NLP
+transformers==5.1.0
+torch==2.10.0
+sentencepiece==0.2.1
+
+# Data Collection
+praw==7.8.1
+newsapi-python==0.2.7
+
+# Blockchain
+web3==7.14.1
+eth-account==0.13.7
+
+# Storage & Utils
+python-dotenv==1.2.1
+pydantic==2.12.5
+aiosqlite==0.22.1
+tenacity==9.1.4

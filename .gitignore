@@ -1,0 +1,25 @@
+# Secrets — NEVER commit these
+.env
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+venv/
+
+# Runtime data
+data/*.db
+data/*.log
+data/STOP
+
+# ML model cache (FinBERT is ~400MB)
+.cache/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# Claude Code config
+.claude/
