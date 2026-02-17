@@ -14,6 +14,7 @@ blocking the main async event loop.
 """
 
 import asyncio
+import json
 from datetime import datetime, timezone
 from typing import TypedDict
 
@@ -129,6 +130,17 @@ class Orchestrator:
                 # Skip low-liquidity markets (hard to trade, wide spreads)
                 if volume < 1000 or liquidity < 500:
                     continue
+
+                # Skip already-resolved markets (price at $0 or $1)
+                prices_str = market.get("outcomePrices")
+                if prices_str:
+                    try:
+                        prices = [float(p) for p in json.loads(prices_str)]
+                        yes_price = prices[0] if prices else 0.5
+                        if yes_price <= 0.02 or yes_price >= 0.98:
+                            continue
+                    except (json.JSONDecodeError, ValueError, IndexError):
+                        pass
 
                 filtered.append(market)
 

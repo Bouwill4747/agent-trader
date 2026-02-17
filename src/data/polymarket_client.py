@@ -133,7 +133,13 @@ class PolymarketClient:
             self.gamma_limiter.wait()
             response = self.gamma.get(
                 "/markets",
-                params={"limit": min(limit, self.MAX_MARKETS), "active": active},
+                params={
+                    "limit": min(limit, self.MAX_MARKETS),
+                    "active": active,
+                    "closed": False,
+                    "order": "liquidity",
+                    "ascending": False,
+                },
             )
             response.raise_for_status()
 
