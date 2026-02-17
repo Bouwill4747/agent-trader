@@ -20,6 +20,7 @@ data/STOP
 .vscode/
 .idea/
 *.swp
+*.save
 
 # Claude Code config
 .claude/
