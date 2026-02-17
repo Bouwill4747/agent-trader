@@ -300,6 +300,10 @@ class Orchestrator:
             ))
             results.append(result)
 
+            # Save snapshot after each successful trade so positions survive crashes
+            if result.success:
+                asyncio.run(self.portfolio.save_snapshot())
+
         successful = sum(1 for r in results if r.success)
         logger.info("%d orders placed successfully out of %d attempts", successful, len(results))
 
