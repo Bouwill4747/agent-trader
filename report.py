@@ -152,18 +152,23 @@ def print_report(
             unrealized = snapshot.get("unrealized_pnl", 0.0)
             total_exposure = snapshot.get("total_exposure", 0)
 
-        current_value = snapshot["bankroll"] + total_exposure
+        # snapshot["bankroll"] is total_value (cash + positions), not just cash
+        snapshot_total = snapshot["bankroll"]
+        cash = snapshot_total - snapshot.get("total_exposure", 0)
+        current_value = cash + total_exposure  # use live exposure if available
         total_return = (current_value - starting_bankroll) / starting_bankroll * 100
         realized = snapshot.get("realized_pnl", 0.0)
         peak = snapshot.get("peak_bankroll", starting_bankroll)
-        drawdown = snapshot.get("drawdown_pct", 0.0)
+        if current_value > peak:
+            peak = current_value  # fix stale peak from snapshot
+        drawdown = (peak - current_value) / peak * 100 if peak > 0 else 0.0
 
         print()
         print("  Portfolio")
         print("  " + "\u2500" * 35)
         print(f"  Starting Bankroll:   ${starting_bankroll:.2f}")
         print(f"  Current Value:       ${current_value:.2f}")
-        print(f"  Cash:                ${snapshot['bankroll']:.2f}")
+        print(f"  Cash:                ${cash:.2f}")
         print(f"  Total Return:        {total_return:+.2f}%")
         print(f"  Realized PnL:        {format_dollar(realized)}")
         print(f"  Unrealized PnL:      {format_dollar(unrealized)}")

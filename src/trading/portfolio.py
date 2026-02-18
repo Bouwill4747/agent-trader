@@ -121,12 +121,18 @@ class Portfolio:
         self.realized_pnl += pnl
         self.trade_count += 1
 
+        del self.positions[market_id]
+
+        # Update peak after close changes total value
+        current = self.total_value
+        if current > self.peak_bankroll:
+            self.peak_bankroll = current
+
         logger.info(
             "Closed: %s %.0f shares @ $%.3f — PnL: $%.2f — Cash: $%.2f",
             market_id[:8], pos.shares, price, pnl, self.cash
         )
 
-        del self.positions[market_id]
         return True
 
     def resolve_position(self, market_id: str, won: bool):
@@ -146,13 +152,18 @@ class Portfolio:
         self.cash += proceeds
         self.realized_pnl += pnl
 
+        del self.positions[market_id]
+
+        # Update peak after resolution changes total value
+        current = self.total_value
+        if current > self.peak_bankroll:
+            self.peak_bankroll = current
+
         outcome = "WON" if won else "LOST"
         logger.info(
             "Resolved %s: %s — Payout: $%.2f — PnL: $%.2f",
             outcome, pos.question[:40], proceeds, pnl
         )
-
-        del self.positions[market_id]
 
     # ──────────────────────────────────────────────
     # Price Updates

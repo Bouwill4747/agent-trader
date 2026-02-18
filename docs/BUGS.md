@@ -149,12 +149,32 @@
 
 ---
 
+### BUG-015: Report double-counting portfolio value
+- **Date**: 2026-02-18
+- **File(s)**: `report.py`, `src/trading/portfolio.py`
+- **Severity**: Medium
+- **Symptom**: Report showed Current Value $175.88 and Cash $155.88, but actual cash was $135.88 and total value was $155.88. Portfolio appeared 13% richer than reality.
+- **Root Cause**: `save_snapshot()` stores `bankroll = self.total_value` (cash + position value = $155.88). But `report.py` treated `bankroll` as cash and added `total_exposure` on top, double-counting position value.
+- **Fix**: Report now derives cash as `snapshot["bankroll"] - snapshot["total_exposure"]`, then adds live position exposure to get current value.
+- **Lesson Learned**: When one module saves data and another reads it, document what each field actually means. "bankroll" sounds like cash, but it was total value. A comment or better field name would have prevented this.
+
+### BUG-016: Peak value never updated after position exits
+- **Date**: 2026-02-18
+- **File(s)**: `src/trading/portfolio.py`
+- **Severity**: Medium
+- **Symptom**: After a $55.88 profit from a resolved market, peak_bankroll still showed $100.00 (the starting value). Drawdown calculations would be wrong.
+- **Root Cause**: `peak_bankroll` was only updated inside the `drawdown_pct` property getter (lazy evaluation). After `resolve_position()` or `close_position()` added proceeds to cash, peak was never rechecked before the next snapshot was saved.
+- **Fix**: Added explicit `peak_bankroll` update in both `close_position()` and `resolve_position()` immediately after the position is removed and cash is updated.
+- **Lesson Learned**: Don't rely on property getters for side effects. If a value needs to stay in sync, update it explicitly at every mutation point. Lazy evaluation is fine for read-only calculations, not for stateful tracking.
+
+---
+
 ## Stats
 
 | Metric | Count |
 |--------|-------|
-| Total bugs | 14 |
+| Total bugs | 16 |
 | Critical | 5 |
 | High | 5 |
-| Medium | 2 |
+| Medium | 4 |
 | Low | 2 |
