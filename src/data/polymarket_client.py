@@ -263,15 +263,29 @@ class PolymarketClient:
             return None
 
     def get_midpoint(self, token_id: str) -> float | None:
-        """Get the midpoint price (average of best bid and best ask)."""
-        if not self.clob:
-            return None
+        """Get the midpoint price (average of best bid and best ask).
+
+        Uses the CLOB SDK if authenticated, otherwise falls back to a
+        direct HTTP call (the midpoint endpoint is public).
+        """
         try:
             _validate_id(token_id, "token_id")
             self.clob_limiter.wait()
-            midpoint = self.clob.get_midpoint(token_id)
-            return float(midpoint)
-        except (ConnectionError, TimeoutError, OSError) as e:
+
+            if self.clob:
+                midpoint = self.clob.get_midpoint(token_id)
+                return float(midpoint)
+
+            # Fallback: direct HTTP call (no auth required)
+            resp = self.gamma.get(
+                f"{CLOB_API_URL}/midpoint",
+                params={"token_id": token_id},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            return float(data.get("mid", 0)) if isinstance(data, dict) else float(data)
+
+        except (ConnectionError, TimeoutError, OSError, httpx.HTTPError) as e:
             logger.error("Midpoint connection error for %s: %s", token_id, type(e).__name__)
             return None
         except (ValueError, TypeError) as e:
