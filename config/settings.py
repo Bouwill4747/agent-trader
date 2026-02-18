@@ -36,7 +36,7 @@ POLYGON_CHAIN_ID = 137
 
 PAPER_TRADING = os.getenv("PAPER_TRADING", "true").lower() == "true"
 INITIAL_BANKROLL = float(os.getenv("INITIAL_BANKROLL", "100"))
-CYCLE_INTERVAL_SECONDS = 1800  # 30 minutes
+CYCLE_INTERVAL_SECONDS = 3600  # 60 minutes
 
 
 # === Risk Limits ===

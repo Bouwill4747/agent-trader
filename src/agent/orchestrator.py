@@ -26,6 +26,7 @@ from config.settings import (
 )
 from src.data.polymarket_client import PolymarketClient
 from src.data.news_collector import NewsCollector
+from src.data.rss_collector import RSSCollector
 from src.data.sentiment_scraper import SentimentScraper
 from src.analysis.signal_generator import SignalGenerator, TradingSignal
 from src.trading.risk_manager import RiskManager
@@ -69,6 +70,7 @@ class Orchestrator:
         # Initialize all components
         self.client = PolymarketClient()
         self.news = NewsCollector()
+        self.rss = RSSCollector()
         self.sentiment = SentimentScraper()
         self.signals = SignalGenerator()
         self.risk = RiskManager()
@@ -171,11 +173,21 @@ class Orchestrator:
         sentiment = {}
         errors = state.get("errors", [])
 
-        # Fetch news and Reddit independently — one failing shouldn't block the other
+        # Fetch all sources independently — one failing shouldn't block the others
         try:
             articles = self.news.get_articles_for_markets(markets)
         except Exception as e:
             logger.error("News collection failed: %s", e)
+            errors.append(str(e))
+
+        try:
+            rss_articles = self.rss.get_articles_for_markets(markets)
+            # Merge RSS into articles dict (RSS supplements NewsAPI per market)
+            for market_id, rss_list in rss_articles.items():
+                existing = articles.get(market_id, [])
+                articles[market_id] = existing + rss_list
+        except Exception as e:
+            logger.error("RSS collection failed: %s", e)
             errors.append(str(e))
 
         try:
@@ -188,7 +200,7 @@ class Orchestrator:
         total_posts = sum(len(v) for v in sentiment.values())
 
         logger.info(
-            "Collected %d articles and %d Reddit posts for %d markets",
+            "Collected %d articles (NewsAPI + RSS) and %d Reddit posts for %d markets",
             total_articles, total_posts, len(markets)
         )
 
