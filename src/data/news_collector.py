@@ -7,9 +7,16 @@ Implements a simple cache to avoid redundant API calls.
 import time
 import re
 from newsapi import NewsApiClient
+from pydantic import ValidationError
 
 from config.settings import NEWS_API_KEY
+from src.data.models import NewsArticle
 from src.utils.logger import setup_logger
+
+try:
+    from newsapi.newsapi_exception import NewsAPIException
+except ImportError:
+    NewsAPIException = Exception
 
 logger = setup_logger("news_collector")
 
@@ -91,14 +98,18 @@ class NewsCollector:
 
             articles = []
             for article in response.get("articles", []):
-                articles.append({
-                    "title": article.get("title", ""),
-                    "source": article.get("source", {}).get("name", "Unknown"),
-                    "description": article.get("description", ""),
-                    "content": article.get("content", ""),
-                    "url": article.get("url", ""),
-                    "published_at": article.get("publishedAt", ""),
-                })
+                try:
+                    validated = NewsArticle(
+                        title=article.get("title"),
+                        source=article.get("source", {}).get("name", "Unknown"),
+                        description=article.get("description"),
+                        content=article.get("content"),
+                        url=article.get("url", ""),
+                        published_at=article.get("publishedAt", ""),
+                    )
+                    articles.append(validated.model_dump())
+                except ValidationError as e:
+                    logger.debug("Skipping invalid article: %s", e.errors()[0]["msg"])
 
             # Update cache
             self.cache[cache_key] = (time.time(), articles)
@@ -109,8 +120,8 @@ class NewsCollector:
             )
             return articles
 
-        except (ConnectionError, TimeoutError, OSError) as e:
-            logger.error("NewsAPI connection error for '%s': %s", query, type(e).__name__)
+        except (NewsAPIException, ConnectionError, TimeoutError, OSError) as e:
+            logger.error("NewsAPI error for '%s': %s", query, type(e).__name__)
             return []
         except (ValueError, KeyError, TypeError) as e:
             logger.error("NewsAPI response parse error for '%s': %s", query, e)

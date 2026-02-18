@@ -186,3 +186,61 @@ async def get_first_snapshot() -> dict | None:
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
+
+
+async def insert_agent_run(run: dict) -> int:
+    """Record the start of an agent cycle. Returns the row ID."""
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "INSERT INTO agent_runs (start_time, status) VALUES (?, ?)",
+            (run["start_time"], run.get("status", "running")),
+        )
+        await db.commit()
+        return cursor.lastrowid
+
+
+async def update_agent_run(run_id: int, updates: dict):
+    """Update an agent run with end-of-cycle stats."""
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+            UPDATE agent_runs
+            SET end_time = ?, status = ?, markets_analyzed = ?,
+                signals_generated = ?, trades_executed = ?, errors = ?
+            WHERE id = ?
+        """, (
+            updates.get("end_time"),
+            updates.get("status", "completed"),
+            updates.get("markets_analyzed", 0),
+            updates.get("signals_generated", 0),
+            updates.get("trades_executed", 0),
+            updates.get("errors"),
+            run_id,
+        ))
+        await db.commit()
+
+
+async def get_agent_run_stats() -> dict:
+    """Get summary statistics from all agent runs."""
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("""
+            SELECT
+                COUNT(*) as total_cycles,
+                SUM(CASE WHEN status LIKE 'completed%' THEN 1 ELSE 0 END) as successful,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed,
+                COALESCE(SUM(markets_analyzed), 0) as total_markets,
+                COALESCE(SUM(signals_generated), 0) as total_signals,
+                COALESCE(SUM(trades_executed), 0) as total_trades
+            FROM agent_runs
+        """)
+        row = await cursor.fetchone()
+        return {
+            "total_cycles": row[0],
+            "successful": row[1],
+            "failed": row[2],
+            "total_markets": row[3],
+            "total_signals": row[4],
+            "total_trades": row[5],
+        }

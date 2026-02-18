@@ -32,7 +32,7 @@ from src.trading.risk_manager import RiskManager
 from src.trading.executor import Executor
 from src.trading.portfolio import Portfolio
 from src.utils.logger import setup_logger
-from src.utils.db import init_db
+from src.utils.db import init_db, insert_agent_run, update_agent_run
 
 logger = setup_logger("orchestrator")
 
@@ -406,6 +406,13 @@ class Orchestrator:
             logger.warning("Kill switch active — skipping cycle")
             return
 
+        # Record cycle start in database
+        run_id = None
+        try:
+            run_id = await insert_agent_run({"start_time": cycle_start})
+        except Exception as e:
+            logger.warning("Failed to record cycle start: %s", e)
+
         # Run the sync graph in a thread to avoid blocking the event loop
         initial_state = {
             "markets": [],
@@ -429,12 +436,31 @@ class Orchestrator:
             # Reset error counter on successful cycle
             self._consecutive_errors = 0
 
+            # Record cycle completion
+            if run_id:
+                await update_agent_run(run_id, {
+                    "end_time": datetime.now(timezone.utc).isoformat(),
+                    "status": "completed_with_errors" if errors else "completed",
+                    "markets_analyzed": len(result.get("markets", [])),
+                    "signals_generated": len(result.get("signals", [])),
+                    "trades_executed": len(result.get("execution_results", [])),
+                    "errors": "; ".join(str(e) for e in errors) if errors else None,
+                })
+
         except Exception as e:
             self._consecutive_errors += 1
             logger.error(
                 "Cycle failed (%d consecutive): %s",
                 self._consecutive_errors, e
             )
+
+            # Record cycle failure
+            if run_id:
+                await update_agent_run(run_id, {
+                    "end_time": datetime.now(timezone.utc).isoformat(),
+                    "status": "failed",
+                    "errors": str(e),
+                })
 
             if self._consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                 logger.critical(

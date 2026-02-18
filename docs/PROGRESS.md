@@ -206,7 +206,7 @@ The plan originally had different take-profit formulas for YES vs NO positions (
 | `tests/test_exit_logic.py` | 12 new tests: resolved, stop loss, take profit, paper exit integration |
 
 ### Next Steps
-- [ ] Update docs/GLOSSARY.md with new terms (take profit, stop loss, resolved market)
+- [x] Update docs/GLOSSARY.md with new terms (take profit, stop loss, resolved market) *(done in Session 7)*
 - [ ] Run live and verify EXIT log lines appear for qualifying positions
 
 ---
@@ -237,6 +237,50 @@ The plan originally had different take-profit formulas for YES vs NO positions (
 | Completed trade matching | FIFO BUY→SELL per market_id | Simple, correct for sequential trades; avoids complex lot matching |
 | Positions JSON handling | Supports both dict and list formats | Actual DB stores dict keyed by market_id; future-proofs for format changes |
 | No tests for report.py | Read-only display tool | No business logic to break; DB functions already covered by existing tests |
+
+---
+
+## Session 7 — 2026-02-18: Live Prices, Cycle Tracking, and Audit Fixes
+
+### Completed
+- [x] Added 3 glossary terms: stop loss, take profit, resolved market
+- [x] Committed all Session 5+6 work (exit logic, report CLI)
+- [x] Live price fetching in `report.py` — fetches CLOB midpoint for open positions, shows `[live prices]` or `[snapshot prices]`
+- [x] Wired up `agent_runs` table — orchestrator records each cycle's start/end, status, and stats
+- [x] Added Agent Activity section to report (total cycles, success/fail, markets/signals/trades)
+- [x] Narrowed CLOB auth exception from `except Exception` to specific types + `PolyApiException`
+- [x] Applied `NewsArticle` Pydantic validation in `news_collector.py`, added `NewsAPIException` handling
+- [x] Created `RedditPost` Pydantic model in `models.py`, applied in `sentiment_scraper.py`, added `PRAWException` handling
+- [x] Deferred async HTTP migration (documented below)
+- [x] All 72 tests still passing
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `docs/GLOSSARY.md` | Added stop loss, take profit, resolved market to Trading Concepts table |
+| `report.py` | Live price fetching via httpx, Agent Activity section, recalculated unrealized PnL |
+| `src/utils/db.py` | Added `insert_agent_run()`, `update_agent_run()`, `get_agent_run_stats()` |
+| `src/agent/orchestrator.py` | Wired cycle recording into `run_cycle()` (start, success, failure paths) |
+| `src/data/polymarket_client.py` | Narrowed CLOB auth exception, imported `PolyApiException` |
+| `src/data/news_collector.py` | Applied `NewsArticle` Pydantic model, catch `NewsAPIException` |
+| `src/data/models.py` | Added `RedditPost` model with coerce validators |
+| `src/data/sentiment_scraper.py` | Applied `RedditPost` model, catch `PRAWException` |
+| `docs/PROGRESS.md` | Session 7 entry |
+
+### Decisions Made
+| Decision | Choice | Reasoning |
+|----------|--------|-----------|
+| Live price source | Direct httpx GET to CLOB `/midpoint` | Public endpoint, no auth needed, avoids instantiating full `PolymarketClient` |
+| Cycle recording failure | Log warning, continue cycle | Recording telemetry shouldn't block trading |
+| Async HTTP migration | Deferred | High risk, low value — 30-min cycle agent doesn't need async; PRAW, newsapi, py-clob-client are all fundamentally sync; sync/async mix already caused BUG-004 |
+| PRAW exception import | Guarded with try/except ImportError | Defensive against library restructuring |
+
+### Remaining Items (Future)
+- [ ] Run live and verify EXIT log lines appear for qualifying positions
+- [ ] Async HTTP client migration — deferred (high risk, low value; see decision above)
+- [ ] SQLCipher for database encryption at rest
+- [ ] Credential rotation mechanism
+- [ ] Process isolation (separate research and trading processes)
 
 ---
 

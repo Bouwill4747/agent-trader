@@ -6,8 +6,16 @@ Returns raw text for downstream analysis by FinBERT.
 
 import os
 import praw
+from pydantic import ValidationError
+
 from config.settings import REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET
+from src.data.models import RedditPost
 from src.utils.logger import setup_logger
+
+try:
+    from praw.exceptions import PRAWException
+except ImportError:
+    PRAWException = Exception
 
 logger = setup_logger("sentiment_scraper")
 
@@ -49,8 +57,8 @@ class SentimentScraper:
                     timeout=30,
                 )
                 logger.info("Reddit client initialized")
-            except (ConnectionError, TimeoutError, OSError) as e:
-                logger.error("Reddit initialization connection error: %s", type(e).__name__)
+            except (PRAWException, ConnectionError, TimeoutError, OSError) as e:
+                logger.error("Reddit initialization error: %s", type(e).__name__)
             except (ValueError, KeyError) as e:
                 logger.error("Reddit initialization config error: %s", e)
         else:
@@ -98,20 +106,24 @@ class SentimentScraper:
                 if submission.selftext:
                     text += " " + submission.selftext
 
-                posts.append({
-                    "title": submission.title,
-                    "text": text,
-                    "score": submission.score,
-                    "num_comments": submission.num_comments,
-                    "subreddit": subreddit_name,
-                    "url": submission.url,
-                    "created_utc": submission.created_utc,
-                })
+                try:
+                    validated = RedditPost(
+                        title=submission.title,
+                        text=text,
+                        score=submission.score,
+                        num_comments=submission.num_comments,
+                        subreddit=subreddit_name,
+                        url=submission.url,
+                        created_utc=submission.created_utc,
+                    )
+                    posts.append(validated.model_dump())
+                except ValidationError as e:
+                    logger.debug("Skipping invalid Reddit post: %s", e.errors()[0]["msg"])
 
             return posts
 
-        except (ConnectionError, TimeoutError, OSError) as e:
-            logger.error("Reddit connection error for r/%s: %s", subreddit_name, type(e).__name__)
+        except (PRAWException, ConnectionError, TimeoutError, OSError) as e:
+            logger.error("Reddit error for r/%s: %s", subreddit_name, type(e).__name__)
             return []
         except (ValueError, KeyError, AttributeError) as e:
             logger.error("Reddit parse error for r/%s (query: '%s'): %s", subreddit_name, query, e)

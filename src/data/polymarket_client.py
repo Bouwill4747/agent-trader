@@ -13,6 +13,10 @@ from pydantic import ValidationError
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import OrderArgs, ApiCreds
+try:
+    from py_clob_client.exceptions import PolyApiException
+except ImportError:
+    PolyApiException = Exception
 from py_clob_client.order_builder.constants import BUY, SELL
 from py_clob_client.constants import POLYGON
 
@@ -99,7 +103,7 @@ class PolymarketClient:
                     creds = self.clob.create_or_derive_api_creds()
                     self.clob.set_api_creds(creds)
                     logger.info("CLOB client authenticated (derived fresh credentials)")
-            except Exception as e:
+            except (PolyApiException, ValueError, KeyError, ConnectionError, TimeoutError, OSError) as e:
                 logger.error("CLOB authentication failed: %s", e)
                 self.clob = None
         else:
