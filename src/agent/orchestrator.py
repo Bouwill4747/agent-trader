@@ -20,7 +20,10 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph, END
 
-from config.settings import CYCLE_INTERVAL_SECONDS, KILL_SWITCH_PATH
+from config.settings import (
+    CYCLE_INTERVAL_SECONDS, KILL_SWITCH_PATH,
+    EXIT_STOP_LOSS_PCT, EXIT_RESOLVED_THRESHOLD,
+)
 from src.data.polymarket_client import PolymarketClient
 from src.data.news_collector import NewsCollector
 from src.data.sentiment_scraper import SentimentScraper
@@ -310,7 +313,7 @@ class Orchestrator:
         return {"execution_results": results}
 
     def _monitor_positions(self, state: AgentState) -> dict:
-        """Node 6: Check existing positions and update portfolio."""
+        """Node 6: Check existing positions, auto-exit when thresholds hit."""
         logger.info("── Step 6: Monitoring positions ──")
 
         # Update prices for all open positions
@@ -322,13 +325,69 @@ class Orchestrator:
 
         self.portfolio.update_prices(prices)
 
-        # Save snapshot to database (async call)
-        asyncio.run(self.portfolio.save_snapshot())
+        # Check exit conditions for each position
+        # Iterate over a copy since exits delete from the dict
+        for market_id, pos in list(self.portfolio.positions.items()):
+            exit_reason = self._check_exit(pos, pos.current_price)
+            if exit_reason is None:
+                continue
+
+            if exit_reason.startswith("RESOLVED"):
+                # Market resolved — book the outcome directly
+                won = (
+                    (pos.side == "YES" and pos.current_price >= EXIT_RESOLVED_THRESHOLD) or
+                    (pos.side == "NO" and pos.current_price <= (1 - EXIT_RESOLVED_THRESHOLD))
+                )
+                logger.info(
+                    "EXIT [%s]: '%s' — side=%s, price=$%.3f, won=%s",
+                    exit_reason, pos.question[:40], pos.side, pos.current_price, won
+                )
+                self.portfolio.resolve_position(market_id, won=won)
+            else:
+                # Stop loss or take profit — sell shares at market price
+                asyncio.run(self.executor.execute_exit(
+                    market_id=market_id,
+                    token_id=pos.token_id,
+                    question=pos.question,
+                    shares=pos.shares,
+                    price=pos.current_price,
+                    reason=exit_reason,
+                ))
+
+            # Save snapshot after each exit
+            asyncio.run(self.portfolio.save_snapshot())
 
         # Log portfolio summary
         logger.info("\n%s", self.portfolio.summary())
 
         return {}
+
+    def _check_exit(self, pos, current_price: float) -> str | None:
+        """Check whether a position should be exited.
+
+        Returns:
+            Exit reason string, or None to hold.
+        """
+        # --- Resolved market detection ---
+        if current_price >= EXIT_RESOLVED_THRESHOLD:
+            return "RESOLVED_YES"
+        if current_price <= (1 - EXIT_RESOLVED_THRESHOLD):
+            return "RESOLVED_NO"
+
+        # --- Stop loss ---
+        if pos.cost_basis > 0:
+            pnl_pct = pos.unrealized_pnl / pos.cost_basis
+            if pnl_pct <= EXIT_STOP_LOSS_PCT:
+                return "STOP_LOSS"
+
+        # --- Take profit ---
+        # Both YES and NO tokens pay $1 if they win. current_price tracks
+        # the token we hold, so profit = price moving toward $1 in both cases.
+        take_profit_price = pos.avg_price + 0.75 * (1.0 - pos.avg_price)
+        if current_price >= take_profit_price:
+            return "TAKE_PROFIT"
+
+        return None
 
     # ──────────────────────────────────────────────
     # Main loop

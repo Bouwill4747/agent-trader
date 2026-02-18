@@ -179,4 +179,65 @@
 
 ---
 
+## Session 5 — 2026-02-17: Auto-Exit Logic for Open Positions
+
+### Completed
+- [x] Added exit threshold settings (`EXIT_STOP_LOSS_PCT`, `EXIT_RESOLVED_THRESHOLD`) to `config/settings.py`
+- [x] Added `execute_exit()`, `_paper_exit()`, `_live_exit()` methods to `src/trading/executor.py`
+- [x] Added `_check_exit()` helper and exit logic to `_monitor_positions()` in `src/agent/orchestrator.py`
+- [x] Created `tests/test_exit_logic.py` with 12 new tests (exit conditions + paper exit integration)
+- [x] All 72 tests passing
+
+### What It Does
+The agent now automatically exits positions during the monitor step:
+- **Resolved markets**: Price >= $0.95 or <= $0.05 → `resolve_position()` books win/loss
+- **Stop loss**: Position down 40%+ → sells to cut losses
+- **Take profit**: Price moved 75% of distance from entry toward $1.00 → sells to lock in gains
+
+### Key Design Decision
+The plan originally had different take-profit formulas for YES vs NO positions (YES → price toward $1, NO → price toward $0). This was incorrect because `current_price` tracks the token we hold — for NO positions, that's the NO token price, which goes toward $1 when we're winning (same as YES). Unified to a single formula: `take_profit = entry + 0.75 * (1.0 - entry)`.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `config/settings.py` | Added `EXIT_STOP_LOSS_PCT = -0.40`, `EXIT_RESOLVED_THRESHOLD = 0.95` |
+| `src/trading/executor.py` | Added `execute_exit()`, `_paper_exit()`, `_live_exit()` |
+| `src/agent/orchestrator.py` | Added `_check_exit()`, expanded `_monitor_positions()` with exit loop |
+| `tests/test_exit_logic.py` | 12 new tests: resolved, stop loss, take profit, paper exit integration |
+
+### Next Steps
+- [ ] Update docs/GLOSSARY.md with new terms (take profit, stop loss, resolved market)
+- [ ] Run live and verify EXIT log lines appear for qualifying positions
+
+---
+
+## Session 6 — 2026-02-17: Performance Report CLI Tool
+
+### Completed
+- [x] Added `get_all_trades()` and `get_first_snapshot()` query functions to `src/utils/db.py`
+- [x] Created `report.py` CLI tool at project root — reads SQLite and prints formatted performance summary
+- [x] All 72 tests still passing
+
+### What It Does
+`python report.py` prints a formatted dashboard showing:
+- **Portfolio**: starting bankroll, current value, cash, total return, realized/unrealized PnL, peak value, max drawdown
+- **Trade Statistics**: total trades, wins/losses, win rate, avg win/loss, best/worst trade (only for completed BUY→SELL pairs)
+- **Open Positions**: from latest snapshot's `positions_json`, with side, size, entry/current price, PnL
+- **Recent Trades**: last 10 trades with timestamp, side, size, price, question
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/utils/db.py` | Added `get_all_trades()` (all trades ASC for stats) and `get_first_snapshot()` (earliest snapshot for start date) |
+| `report.py` | New file (~150 lines) — standalone CLI tool, no new dependencies |
+
+### Key Design Decisions
+| Decision | Choice | Reasoning |
+|----------|--------|-----------|
+| Completed trade matching | FIFO BUY→SELL per market_id | Simple, correct for sequential trades; avoids complex lot matching |
+| Positions JSON handling | Supports both dict and list formats | Actual DB stores dict keyed by market_id; future-proofs for format changes |
+| No tests for report.py | Read-only display tool | No business logic to break; DB functions already covered by existing tests |
+
+---
+
 <!-- Future sessions will be appended below -->

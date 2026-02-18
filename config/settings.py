@@ -49,6 +49,11 @@ MAX_DRAWDOWN_PCT = 0.20         # Halt trading at 20% drawdown
 MIN_TRADE_SIZE = 1.0            # Polymarket minimum: $1
 MIN_EDGE_THRESHOLD = 0.10       # Only trade when edge > 10%
 
+# === Exit Thresholds ===
+
+EXIT_STOP_LOSS_PCT = -0.40       # Exit when position is down 40%
+EXIT_RESOLVED_THRESHOLD = 0.95   # Price >= 0.95 or <= 0.05 = market resolved
+
 
 # === LLM Settings ===
 

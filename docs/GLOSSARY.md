@@ -48,6 +48,9 @@
 | **PnL** | Profit and Loss. The net gain or loss on your positions. | The bot tracks PnL per position and overall portfolio. |
 | **Position** | Your current holding in a market. E.g., "10 YES shares of Market X at avg price $0.55". | The portfolio module tracks all open positions. |
 | **Drawdown** | The decline from a portfolio's peak value to its lowest point. A 20% drawdown means you lost 20% from your best. | The bot halts trading at 20% drawdown to prevent catastrophic losses. |
+| **Stop Loss** | An automatic exit rule that sells a position when its unrealized loss exceeds a threshold. The agent exits at -40% of cost basis (`EXIT_STOP_LOSS_PCT`). | Prevents catastrophic loss on a single position. A $5.00 position exits at $3.00 remaining value. |
+| **Take Profit** | An automatic exit rule that sells once a position reaches a target gain. Formula: `entry + 0.75 * (1.0 - entry)` — 75% of the way from entry to $1.00. | Locks in gains before the market reverses. Applied in `_check_exit()` during the monitor step. |
+| **Resolved Market** | A market whose outcome is effectively determined — price >= $0.95 (YES won) or <= $0.05 (NO won). Winning shares redeem at $1.00. | The agent detects this via `EXIT_RESOLVED_THRESHOLD` and books the win/loss automatically. |
 
 ## Risk Management
 

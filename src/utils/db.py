@@ -164,3 +164,25 @@ async def get_trade_history(limit: int = 50) -> list:
         )
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+
+async def get_all_trades() -> list:
+    """Fetch ALL trades (oldest first). Used for win/loss statistics."""
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("SELECT * FROM trades ORDER BY id ASC")
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_first_snapshot() -> dict | None:
+    """Fetch the earliest portfolio snapshot (start date and starting bankroll)."""
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute(
+            "SELECT * FROM portfolio_snapshots ORDER BY id ASC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
