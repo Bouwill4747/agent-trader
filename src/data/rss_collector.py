@@ -1,9 +1,9 @@
 """
 RSS collector — fetches news from free RSS feeds for market research.
 
-Covers general news, finance, politics, and crypto with no API key or
-rate limits. Fetches all feeds once per cycle and filters locally by
-keyword relevance to each market question.
+Covers general news, finance, politics, crypto, and esports with no API
+key or rate limits. Fetches all feeds once per cycle and filters locally
+by keyword relevance to each market question.
 
 Feeds used:
   - Reuters (top news, business, politics)
@@ -12,6 +12,7 @@ Feeds used:
   - CNBC
   - CoinDesk  (crypto)
   - CoinTelegraph  (crypto)
+  - HLTV  (CS2 / Counter-Strike esports news)
 """
 
 import re
@@ -33,6 +34,7 @@ FEEDS = {
     "CNBC":             "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
     "CoinDesk":         "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "CoinTelegraph":    "https://cointelegraph.com/rss",
+    "HLTV":             "https://www.hltv.org/rss/news",
 }
 
 # Stop words to strip when extracting keywords

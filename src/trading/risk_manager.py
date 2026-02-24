@@ -12,7 +12,6 @@ from config.settings import (
     MAX_CONCURRENT_POSITIONS,
     MAX_DRAWDOWN_PCT,
     MIN_TRADE_SIZE,
-    MIN_EDGE_THRESHOLD,
 )
 from src.utils.logger import setup_logger
 
@@ -53,6 +52,10 @@ class RiskManager:
         num_positions: int,
         current_drawdown: float,
         direction: str = "BUY_YES",
+        regime: str = "neutral",
+        resolution_type: str = "subjective_event",
+        resolution_clarity_score: int = 1,
+        spread: float = 0.05,
     ) -> RiskDecision:
         """Decide whether to take a trade and how much to risk.
 
@@ -65,6 +68,11 @@ class RiskManager:
             num_positions: Number of open positions
             current_drawdown: Current drawdown percentage (0.0 to 1.0)
             direction: "BUY_YES" or "BUY_NO" — determines edge calculation
+            resolution_type: How market resolves — sets base resolution buffer
+            resolution_clarity_score: 1 (vague) to 5 (precise) — adds clarity penalty
+                clarity_penalty = (5 - score) × 1%
+            spread: Estimated bid-ask spread (fraction). Sets the cost floor:
+                cost_floor = spread × 1.5  (spread + half-spread for slippage)
 
         Returns:
             RiskDecision with approved/rejected, position size, and reason
@@ -95,11 +103,78 @@ class RiskManager:
             edge = estimated_prob - market_price
             effective_price = market_price
 
-        if edge < MIN_EDGE_THRESHOLD:
-            return RiskDecision(
-                approved=False, position_size=0, shares=0,
-                reason=f"Edge too small: {edge:.1%} < {MIN_EDGE_THRESHOLD:.1%}"
+        # ── Check 3b: Regime-based adjustments ──
+        #
+        # Market regime (driven by Fear & Greed index) affects how aggressively
+        # we trade. In panic conditions, assets overshoot and noise is high;
+        # in euphoric conditions, corrections are near.
+        #
+        #   extreme_fear  (0-20):  -60% size, need +5% extra edge
+        #   fear          (21-40): -40% size, need +3% extra edge
+        #   neutral       (41-59): no change
+        #   greed         (60-79): no change
+        #   extreme_greed (80-100):-30% size, need +2% extra edge
+        #
+        _REGIME_ADJUSTMENTS = {
+            "extreme_fear":  (0.40, 0.05),
+            "fear":          (0.60, 0.03),
+            "neutral":       (1.00, 0.00),
+            "greed":         (1.00, 0.00),
+            "extreme_greed": (0.70, 0.02),
+        }
+        regime_size_mult, regime_edge_bonus = _REGIME_ADJUSTMENTS.get(regime, (1.0, 0.0))
+
+        # ── Resolution type + clarity uncertainty buffer ──
+        #
+        # Two components combine to require more edge for riskier resolution:
+        #
+        # 1. Base buffer by resolution type:
+        #   mechanical_numeric  +2%: clear numeric threshold, easy to verify
+        #   price_print         +3%: depends on a specific exchange/data source
+        #   formal_recognition  +4%: requires official body announcement
+        #   subjective_event    +6%: vague language, no clear data source
+        #
+        # 2. Clarity penalty: (5 - clarity_score) × 1%
+        #   score=5 → +0%  (precise: named source + exact criteria)
+        #   score=4 → +1%  (clear with minor ambiguity)
+        #   score=3 → +2%  (moderate interpretation required)
+        #   score=2 → +3%  (source or criteria unclear)
+        #   score=1 → +4%  (vague/discretionary — no explicit source)
+        #
+        # Total buffer range: min 2% (mechanical_numeric, score=5)
+        #                     max 10% (subjective_event, score=1)
+        #
+        _RESOLUTION_BUFFERS = {
+            "mechanical_numeric": 0.02,
+            "price_print":        0.03,
+            "formal_recognition": 0.04,
+            "subjective_event":   0.06,
+        }
+        resolution_buffer = _RESOLUTION_BUFFERS.get(resolution_type, 0.06)
+
+        # Clamp score to [1, 5] defensively before computing penalty
+        _score = max(1, min(5, int(resolution_clarity_score) if resolution_clarity_score else 1))
+        clarity_penalty = (5 - _score) * 0.01
+
+        # Cost floor: the minimum edge needed to cover the round-trip transaction cost.
+        # cost_floor = spread × 1.5  (spread to cross the book + ~half-spread for slippage)
+        cost_floor = spread * 1.5
+
+        effective_min_edge = cost_floor + regime_edge_bonus + resolution_buffer + clarity_penalty
+
+        if edge < effective_min_edge:
+            details = [f"spread_cost={cost_floor:.0%}"]
+            if regime_edge_bonus > 0:
+                details.append(f"regime={regime} +{regime_edge_bonus:.0%}")
+            if resolution_buffer > 0:
+                details.append(f"resolution={resolution_type} +{resolution_buffer:.0%}")
+            if clarity_penalty > 0:
+                details.append(f"clarity={_score}/5 +{clarity_penalty:.0%}")
+            reason = (
+                f"Edge too small: {edge:.1%} < {effective_min_edge:.1%}"
+                f" ({', '.join(details)})"
             )
+            return RiskDecision(approved=False, position_size=0, shares=0, reason=reason)
 
         # ── Check 4: Low confidence filter ──
         if confidence == "low":
@@ -135,10 +210,23 @@ class RiskManager:
         # Calculate dollar amount
         position_size = bankroll * kelly_sized
 
+        # Apply regime size multiplier (reduces size in fearful/euphoric markets)
+        if regime_size_mult < 1.0:
+            position_size *= regime_size_mult
+
         # ── Check 6: Apply hard limits ──
 
-        # Max per-position limit
-        max_position = bankroll * MAX_POSITION_PCT
+        # Max per-position limit — scales with edge strength.
+        # Stronger edge unlocks a larger cap, rewarding high-conviction signals.
+        #   edge < 20%  → 5% of bankroll (standard)
+        #   edge 20-35% → 7% of bankroll
+        #   edge > 35%  → 10% of bankroll
+        if edge >= 0.35:
+            max_position = bankroll * min(MAX_POSITION_PCT * 2.0, 0.10)
+        elif edge >= 0.20:
+            max_position = bankroll * MAX_POSITION_PCT * 1.4
+        else:
+            max_position = bankroll * MAX_POSITION_PCT
         if position_size > max_position:
             position_size = max_position
 

@@ -274,6 +274,9 @@ class PolymarketClient:
 
             if self.clob:
                 midpoint = self.clob.get_midpoint(token_id)
+                # SDK returns {"mid": "0.55"} dict, not a raw number
+                if isinstance(midpoint, dict):
+                    return float(midpoint.get("mid", 0))
                 return float(midpoint)
 
             # Fallback: direct HTTP call (no auth required)
@@ -285,8 +288,8 @@ class PolymarketClient:
             data = resp.json()
             return float(data.get("mid", 0)) if isinstance(data, dict) else float(data)
 
-        except (ConnectionError, TimeoutError, OSError, httpx.HTTPError) as e:
-            logger.error("Midpoint connection error for %s: %s", token_id, type(e).__name__)
+        except (PolyApiException, ConnectionError, TimeoutError, OSError, httpx.HTTPError) as e:
+            logger.error("Midpoint error for %s: %s", token_id, e)
             return None
         except (ValueError, TypeError) as e:
             logger.error("Midpoint parse error for %s: %s", token_id, e)

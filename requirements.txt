@@ -14,9 +14,9 @@ torch==2.10.0
 sentencepiece==0.2.1
 
 # Data Collection
-praw==7.8.1
 newsapi-python==0.2.7
 feedparser==6.0.12
+pytrends==4.9.2
 
 # Blockchain
 web3==7.14.1

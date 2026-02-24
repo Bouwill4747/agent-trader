@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -72,9 +73,12 @@ def setup_logger(name: str, level: str = "INFO") -> logging.Logger:
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    # Console handler — same format, prints to terminal
-    console_handler = logging.StreamHandler()
-    console_handler.setFormatter(formatter)
-    logger.addHandler(console_handler)
+    # Console handler — only when running interactively (not as a systemd service).
+    # When running as a service, systemd redirects stdout to the log file, which
+    # would duplicate every line already written by the file handler above.
+    if sys.stdout.isatty():
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
     return logger

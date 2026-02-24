@@ -7,13 +7,92 @@ import json
 from datetime import datetime, timezone
 from dataclasses import dataclass
 
-from config.settings import MIN_EDGE_THRESHOLD
+from config.settings import MIN_SIGNAL_EDGE
 from src.analysis.finbert_analyzer import FinBERTAnalyzer
 from src.analysis.llm_researcher import LLMResearcher
 from src.utils.logger import setup_logger
 from src.utils.db import insert_signal
 
 logger = setup_logger("signal_generator")
+
+
+def _classify_theme(question: str) -> str:
+    """Classify a market question into a broad theme for analytics.
+
+    Returns one of: crypto, macro, geopolitics, tech, politics, other.
+    Uses keyword matching on the lowercased question text.
+    """
+    q = question.lower()
+    if any(k in q for k in (
+        "bitcoin", "btc", "ethereum", "eth", "crypto", "solana", "sol",
+        "bnb", "xrp", "ripple", "doge", "dogecoin", "cardano", "ada",
+        "coin", "token", "blockchain", "defi", "nft", "stablecoin",
+    )):
+        return "crypto"
+    if any(k in q for k in (
+        "fed ", "federal reserve", "interest rate", "rate hike", "rate cut",
+        "cpi", "inflation", "gdp", "unemployment", "recession",
+        "treasury", "yield curve", "tariff", "trade war",
+    )):
+        return "macro"
+    if any(k in q for k in (
+        "ukraine", "russia", "china", "taiwan", "nato", "sanctions",
+        " war ", "military", "geopolit", "troops", "nuclear",
+        "iran", "israel", "middle east", "north korea",
+    )):
+        return "geopolitics"
+    if any(k in q for k in (
+        "artificial intelligence", " ai ", "openai", "chatgpt",
+        "apple", "google", "microsoft", "amazon", "nvidia", "meta ",
+        "tesla", "spacex", "tech ", "semiconductor", "chip",
+    )):
+        return "tech"
+    if any(k in q for k in (
+        "election", "vote", "president", "congress", "senate",
+        "democrat", "republican", "trump", "biden", "supreme court",
+        "legislation", "bill ", "policy", "governor", "ballot",
+    )):
+        return "politics"
+    return "other"
+
+
+def _estimate_spread(market: dict) -> float:
+    """Estimate the bid-ask spread from market data.
+
+    Uses outcomePrices first: a fair market sums to 1.0, so any shortfall
+    is absorbed by the bid-ask spread.  Falls back to volume-tiered estimates
+    when prices are unavailable or sum to exactly 1.0.
+
+    Returns:
+        Spread as a fraction (e.g. 0.05 = 5%). Always in range [0.01, 0.15].
+    """
+    prices_str = market.get("outcomePrices")
+    if prices_str:
+        try:
+            prices = json.loads(prices_str)
+            if len(prices) >= 2:
+                yes = float(prices[0])
+                no = float(prices[1])
+                implied = 1.0 - (yes + no)
+                if 0.005 < implied < 0.5:   # Sanity check: ignore negligible or nonsensical spreads
+                    return implied
+        except (json.JSONDecodeError, ValueError, IndexError):
+            pass
+
+    # Fallback: volume-tiered estimate
+    try:
+        volume = float(market.get("volume", 0) or 0)
+    except (ValueError, TypeError):
+        volume = 0.0
+
+    if volume >= 500_000:
+        return 0.01   # Very liquid — tight spread
+    elif volume >= 100_000:
+        return 0.02
+    elif volume >= 10_000:
+        return 0.05
+    else:
+        return 0.08   # Thin market — wide spread
 
 
 @dataclass
@@ -30,6 +109,10 @@ class TradingSignal:
     confidence: str            # low / medium / high
     direction: str             # BUY_YES, BUY_NO, or SKIP
     reasoning: str             # Claude's reasoning
+    resolution_type: str = "subjective_event"    # How this market resolves
+    resolution_clarity_score: int = 1           # 1 (vague) → 5 (precise), drives clarity_penalty
+    market_theme: str = "other"                 # crypto/macro/geopolitics/tech/politics/other
+    spread: float = 0.05                        # Estimated bid-ask spread (used as cost floor)
 
 
 class SignalGenerator:
@@ -74,8 +157,11 @@ class SignalGenerator:
         market_id = market.get("id", market.get("condition_id", "unknown"))
         question = market.get("question", "Unknown market")
         current_price = self._get_market_price(market)
+        spread = _estimate_spread(market)
         yes_token_id, no_token_id = self._get_token_ids(market)
         deadline = market.get("end_date_iso", market.get("end_date", "Unknown"))
+        resolution_source = market.get("resolutionSource", "")
+        market_description = market.get("description", "")
 
         logger.info("Generating signal for: '%s' (price: $%.3f)", question[:50], current_price)
 
@@ -106,11 +192,16 @@ class SignalGenerator:
             articles=articles,
             sentiment_score=sentiment_score,
             num_posts=len(reddit_posts),
+            resolution_source=resolution_source,
+            description=market_description,
         )
 
         llm_prob = llm_result["estimated_probability"]
         confidence = llm_result["confidence"]
         reasoning = llm_result["reasoning"]
+        resolution_type = llm_result.get("resolution_type", "subjective_event")
+        resolution_clarity_score = llm_result.get("resolution_clarity_score", 1)
+        market_theme = _classify_theme(question)
 
         # ── Step 3: Blend probabilities ──
         # Convert sentiment (-1 to +1) to a probability adjustment (-0.15 to +0.15)
@@ -129,9 +220,12 @@ class SignalGenerator:
         edge = blended_prob - current_price
 
         # ── Step 5: Determine direction ──
-        if edge > MIN_EDGE_THRESHOLD:
+        # Min-edge for signal generation = cost floor (spread × 1.5) or MIN_SIGNAL_EDGE,
+        # whichever is larger.  The risk manager applies the full dynamic formula later.
+        min_dir_edge = max(spread * 1.5, MIN_SIGNAL_EDGE)
+        if edge > min_dir_edge:
             direction = "BUY_YES"
-        elif edge < -MIN_EDGE_THRESHOLD:
+        elif edge < -min_dir_edge:
             direction = "BUY_NO"
         else:
             direction = "SKIP"
@@ -148,11 +242,17 @@ class SignalGenerator:
             confidence=confidence,
             direction=direction,
             reasoning=reasoning,
+            resolution_type=resolution_type,
+            resolution_clarity_score=resolution_clarity_score,
+            market_theme=market_theme,
+            spread=spread,
         )
 
         logger.info(
-            "Signal: %s | Edge: %+.1f%% | Sentiment: %+.3f | Confidence: %s | '%s'",
-            direction, edge * 100, sentiment_score, confidence, question[:40]
+            "Signal: %s | Edge: %+.1f%% | Spread: %.0f%% | Sentiment: %+.3f | Confidence: %s | "
+            "ResType: %s (clarity %d/5) | Theme: %s | '%s'",
+            direction, edge * 100, spread * 100, sentiment_score, confidence,
+            resolution_type, resolution_clarity_score, market_theme, question[:40]
         )
 
         return signal

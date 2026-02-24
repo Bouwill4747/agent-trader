@@ -78,6 +78,29 @@ async def init_db():
         """)
 
         await db.commit()
+
+        # Migration: add columns to existing trades table.
+        # SQLite has no ADD COLUMN IF NOT EXISTS — try each individually.
+        new_columns = [
+            ("claude_reasoning", "TEXT"),
+            ("estimated_prob",   "REAL"),
+            ("confidence",       "TEXT"),
+            ("edge",             "REAL"),
+            ("actual_outcome",   "INTEGER"),   # NULL=open, 1=won, 0=lost
+            ("exit_reason",      "TEXT"),      # STOP_LOSS, TAKE_PROFIT, RESOLVED_*
+            ("market_theme",            "TEXT"),     # crypto/macro/geopolitics/tech/politics/other
+            ("resolution_type",         "TEXT"),     # mechanical_numeric/price_print/formal_recognition/subjective_event
+            ("resolution_clarity_score","INTEGER"),  # 1 (vague) to 5 (precise)
+        ]
+        for col_name, col_type in new_columns:
+            try:
+                await db.execute(
+                    f"ALTER TABLE trades ADD COLUMN {col_name} {col_type}"
+                )
+                await db.commit()
+            except Exception:
+                pass  # Column already exists
+
         logger.info("Database initialized at %s", DATABASE_PATH)
 
 
@@ -88,16 +111,86 @@ async def insert_trade(trade: dict):
         await db.execute("""
             INSERT INTO trades
                 (timestamp, market_id, token_id, question, side,
-                 price, size, total_cost, order_type, status, paper_trade)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 price, size, total_cost, order_type, status, paper_trade,
+                 claude_reasoning, estimated_prob, confidence, edge,
+                 market_theme, resolution_type, resolution_clarity_score)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             trade["timestamp"], trade["market_id"], trade["token_id"],
             trade.get("question", ""), trade["side"],
             trade["price"], trade["size"], trade["total_cost"],
             trade.get("order_type", "GTC"), trade.get("status", "pending"),
-            trade.get("paper_trade", 1)
+            trade.get("paper_trade", 1),
+            trade.get("claude_reasoning"), trade.get("estimated_prob"),
+            trade.get("confidence"), trade.get("edge"),
+            trade.get("market_theme"), trade.get("resolution_type"),
+            trade.get("resolution_clarity_score"),
         ))
         await db.commit()
+
+
+async def update_trade_outcome(market_id: str, outcome: int, exit_reason: str):
+    """Record the actual outcome on the original BUY trade for a market.
+
+    Finds the most recent BUY trade for market_id where actual_outcome is
+    still NULL (i.e. not yet resolved) and sets outcome + exit_reason.
+
+    Args:
+        market_id: The market condition ID.
+        outcome: 1 = won (profitable), 0 = lost.
+        exit_reason: "STOP_LOSS", "TAKE_PROFIT", "RESOLVED_YES", "RESOLVED_NO".
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+            UPDATE trades
+            SET actual_outcome = ?, exit_reason = ?
+            WHERE id = (
+                SELECT id FROM trades
+                WHERE market_id = ? AND side = 'BUY' AND actual_outcome IS NULL
+                ORDER BY id DESC
+                LIMIT 1
+            )
+        """, (outcome, exit_reason, market_id))
+        await db.commit()
+
+
+async def get_calibration_stats() -> list:
+    """Return win-rate vs estimated-probability grouped by confidence level.
+
+    Used in report.py to show whether Claude's confidence correlates with
+    actual trade outcomes. A well-calibrated model should have:
+      high   confidence → win rate close to avg_estimated_prob
+      medium confidence → win rate close to avg_estimated_prob
+      low    confidence → win rate close to avg_estimated_prob
+
+    Returns:
+        List of dicts with keys: confidence, total, wins, win_rate, avg_estimated_prob.
+        Only includes rows where actual_outcome IS NOT NULL (resolved trades).
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT
+                confidence,
+                COUNT(*) AS total,
+                SUM(actual_outcome) AS wins,
+                ROUND(AVG(actual_outcome), 3) AS win_rate,
+                ROUND(AVG(estimated_prob), 3) AS avg_estimated_prob
+            FROM trades
+            WHERE side = 'BUY'
+              AND actual_outcome IS NOT NULL
+              AND confidence IS NOT NULL
+            GROUP BY confidence
+            ORDER BY
+                CASE confidence
+                    WHEN 'high'   THEN 1
+                    WHEN 'medium' THEN 2
+                    WHEN 'low'    THEN 3
+                    ELSE 4
+                END
+        """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
 
 
 async def insert_signal(signal: dict):

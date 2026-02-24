@@ -167,14 +167,34 @@
 - **Fix**: Added explicit `peak_bankroll` update in both `close_position()` and `resolve_position()` immediately after the position is removed and cash is updated.
 - **Lesson Learned**: Don't rely on property getters for side effects. If a value needs to stay in sync, update it explicitly at every mutation point. Lazy evaluation is fine for read-only calculations, not for stateful tracking.
 
+### BUG-017: CLOB SDK get_midpoint returns dict, code expects float
+- **Date**: 2026-02-18
+- **File(s)**: `src/data/polymarket_client.py`
+- **Severity**: Medium
+- **Symptom**: `get_midpoint()` returned `None` for all tokens when using authenticated CLOB client. Log showed: `Midpoint parse error: float() argument must be a string or a real number, not 'dict'`
+- **Root Cause**: The `py_clob_client` SDK's `get_midpoint()` returns `{"mid": "0.225"}` (a dict with a string value), but our code called `float(midpoint)` directly on the dict. The httpx fallback path already handled the dict format correctly, but the SDK path didn't.
+- **Fix**: Added `isinstance(midpoint, dict)` check — extract `midpoint.get("mid", 0)` before converting to float. Also added `PolyApiException` to the exception handler for 404s (token not found).
+- **Lesson Learned**: Always check what format a third-party SDK actually returns — don't assume it matches the raw HTTP API. The same endpoint can return different shapes depending on whether you use the SDK wrapper or call it directly.
+
+---
+
+### BUG-018: Position limit overrun — 11 positions when max is 10
+- **Date**: 2026-02-23
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: High
+- **Symptom**: Portfolio reached 11 open positions despite `MAX_CONCURRENT_POSITIONS = 10`. Log showed `Max positions reached: 11/10` on subsequent cycles.
+- **Root Cause**: In `_evaluate_risks()`, every signal was evaluated with the same `num_positions=self.portfolio.num_positions` value. That value doesn't update within the loop — so if the portfolio had 9 positions and 2 signals both passed the limit check (each seeing 9 < 10), both got approved and both got executed, landing at 11.
+- **Fix**: Added `approved_this_cycle` counter in `_evaluate_risks()`. Each approval increments it, and it's added to `num_positions` for all subsequent checks in the same batch. Also added a live position count guard in `_execute_trades()` as a safety net — if the actual portfolio count is already at the limit, remaining approved trades are skipped.
+- **Lesson Learned**: When iterating over a batch of decisions that mutate shared state, you must track in-flight changes within the loop — not just read from the shared state once at the start. The same pattern can cause bugs in any loop that approves/allocates from a shared pool.
+
 ---
 
 ## Stats
 
 | Metric | Count |
 |--------|-------|
-| Total bugs | 16 |
+| Total bugs | 18 |
 | Critical | 5 |
-| High | 5 |
-| Medium | 4 |
+| High | 6 |
+| Medium | 5 |
 | Low | 2 |

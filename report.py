@@ -8,12 +8,14 @@ Usage: python report.py
 import asyncio
 import json
 from collections import defaultdict
+from datetime import datetime, timezone
 
 import httpx
 
 from config.settings import PAPER_TRADING, INITIAL_BANKROLL, CLOB_API_URL
 from src.utils.db import (
-    get_latest_snapshot, get_first_snapshot, get_all_trades, get_agent_run_stats,
+    get_latest_snapshot, get_first_snapshot, get_all_trades,
+    get_agent_run_stats, get_calibration_stats,
 )
 
 
@@ -90,11 +92,48 @@ def compute_trade_stats(trades: list) -> dict:
     }
 
 
+def print_calibration(stats: list):
+    """Print Claude's calibration: estimated probability vs actual win rate."""
+    print()
+    print("  Calibration (Claude accuracy by confidence level)")
+    print("  " + "\u2500" * 45)
+
+    total_resolved = sum(r["total"] for r in stats)
+    if total_resolved < 5:
+        print(f"  Not enough data yet ({total_resolved} resolved trade(s)).")
+        print("  Need at least 5 resolved trades to show calibration.")
+        return
+
+    header = f"  {'Confidence':<10} {'Trades':>7} {'Wins':>6} {'Win Rate':>10} {'Estimated':>10} {'Delta':>8}"
+    print(header)
+    print("  " + "\u2500" * 55)
+
+    for row in stats:
+        conf = row["confidence"] or "unknown"
+        total = row["total"]
+        wins = int(row["wins"] or 0)
+        win_rate = (row["win_rate"] or 0) * 100
+        avg_prob = (row["avg_estimated_prob"] or 0) * 100
+        delta = win_rate - avg_prob  # negative = overconfident
+
+        delta_str = f"{delta:+.1f}%"
+        print(
+            f"  {conf:<10} {total:>7} {wins:>6} {win_rate:>9.1f}% "
+            f"{avg_prob:>9.1f}% {delta_str:>8}"
+        )
+
+    print()
+    print("  Delta = Win Rate − Avg Estimated Prob")
+    print("  Negative delta = overconfident (Claude estimated higher than it achieved)")
+    print("  Need 20+ trades per level for statistical significance")
+
+
 def print_report(
     snapshot: dict | None,
     first_snapshot: dict | None,
     trades: list,
     run_stats: dict | None,
+    calibration: list | None = None,
 ):
     """Print the formatted performance report."""
 
@@ -106,9 +145,12 @@ def print_report(
         since = first_snapshot["timestamp"][:10]
         starting_bankroll = first_snapshot["bankroll"]
 
+    generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
     print()
     print("\u2550" * 50)
     print("  Polymarket Agent \u2014 Performance Report")
+    print(f"  Generated: {generated}")
     print(f"  Mode: {mode} | Since: {since}")
     print("\u2550" * 50)
 
@@ -234,6 +276,10 @@ def print_report(
         print("  " + "\u2500" * 35)
         print("  No open positions.")
 
+    # --- Calibration ---
+    if calibration is not None:
+        print_calibration(calibration)
+
     # --- Recent Trades ---
     print()
     # Show the 10 most recent trades (last 10 from the ASC-sorted list)
@@ -263,7 +309,8 @@ async def main():
     first_snapshot = await get_first_snapshot()
     trades = await get_all_trades()
     run_stats = await get_agent_run_stats()
-    print_report(snapshot, first_snapshot, trades, run_stats)
+    calibration = await get_calibration_stats()
+    print_report(snapshot, first_snapshot, trades, run_stats, calibration)
 
 
 if __name__ == "__main__":

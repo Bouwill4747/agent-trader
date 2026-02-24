@@ -15,6 +15,7 @@ blocking the main async event loop.
 
 import asyncio
 import json
+import re
 from datetime import datetime, timezone
 from typing import TypedDict
 
@@ -23,21 +24,98 @@ from langgraph.graph import StateGraph, END
 from config.settings import (
     CYCLE_INTERVAL_SECONDS, KILL_SWITCH_PATH,
     EXIT_STOP_LOSS_PCT, EXIT_RESOLVED_THRESHOLD,
+    SKIP_MARKET_KEYWORDS, MAX_CONCURRENT_POSITIONS,
 )
 from src.data.polymarket_client import PolymarketClient
 from src.data.news_collector import NewsCollector
 from src.data.rss_collector import RSSCollector
-from src.data.sentiment_scraper import SentimentScraper
+from src.data.stocktwits_collector import StocktwitsCollector
+from src.data.trends_collector import TrendsCollector
+from src.data.coingecko_collector import CoinGeckoCollector
+from src.data.metaculus_collector import MetaculusCollector
+from src.data.fear_greed_collector import FearGreedCollector
+from src.data.fred_collector import FREDCollector
+from src.data.finnhub_collector import FinnhubCollector
 from src.analysis.signal_generator import SignalGenerator, TradingSignal
 from src.trading.risk_manager import RiskManager
 from src.trading.executor import Executor
 from src.trading.portfolio import Portfolio
 from src.utils.logger import setup_logger
-from src.utils.db import init_db, insert_agent_run, update_agent_run
+from src.utils.db import init_db, insert_agent_run, update_agent_run, update_trade_outcome
 
 logger = setup_logger("orchestrator")
 
 MAX_CONSECUTIVE_ERRORS = 5
+
+
+# ──────────────────────────────────────────────
+# Market duration helper
+# ──────────────────────────────────────────────
+
+def _days_until_resolution(market: dict) -> int:
+    """Return how many days until this market resolves.
+
+    Uses end_date_iso first, falls back to end_date.
+    Returns 999 if the date is missing or unparseable (treated as long-term).
+    """
+    date_str = market.get("end_date_iso") or market.get("end_date")
+    if not date_str:
+        return 999
+    try:
+        date_str = str(date_str).replace("Z", "+00:00")
+        if "T" in date_str:
+            end = datetime.fromisoformat(date_str)
+        else:
+            end = datetime.fromisoformat(date_str).replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return max(0, (end - now).days)
+    except (ValueError, TypeError):
+        return 999
+
+
+# ──────────────────────────────────────────────
+# Deduplication helper
+# ──────────────────────────────────────────────
+
+def _deduplicate_articles(articles: list) -> list:
+    """Remove duplicate articles from a list.
+
+    An article is a duplicate if its URL exactly matches a previous one,
+    or if its normalized title prefix (first 8 words, lowercased, no
+    punctuation) matches a previous one.  When duplicates exist, the
+    first occurrence (usually from the primary source) is kept.
+
+    Args:
+        articles: List of article dicts with optional 'title' and 'url' keys.
+
+    Returns:
+        De-duplicated list preserving original order.
+    """
+    seen_titles: set[str] = set()
+    seen_urls: set[str] = set()
+    result = []
+
+    for article in articles:
+        url = article.get("url", "")
+        title = article.get("title", "")
+
+        # Normalize title: lowercase, strip punctuation, first 8 words
+        norm = re.sub(r"[^\w\s]", "", title.lower())
+        norm = " ".join(norm.split()[:8])
+
+        if url and url in seen_urls:
+            continue
+        if norm and norm in seen_titles:
+            continue
+
+        if url:
+            seen_urls.add(url)
+        if norm:
+            seen_titles.add(norm)
+
+        result.append(article)
+
+    return result
 
 
 # ──────────────────────────────────────────────
@@ -57,6 +135,7 @@ class AgentState(TypedDict):
     execution_results: list     # OrderResult objects
     cycle_start: str            # ISO timestamp of cycle start
     errors: list                # Any errors encountered during the cycle
+    regime: str                 # Market regime: extreme_fear/fear/neutral/greed/extreme_greed
 
 
 # ──────────────────────────────────────────────
@@ -71,7 +150,13 @@ class Orchestrator:
         self.client = PolymarketClient()
         self.news = NewsCollector()
         self.rss = RSSCollector()
-        self.sentiment = SentimentScraper()
+        self.stocktwits = StocktwitsCollector()
+        self.trends = TrendsCollector()
+        self.coingecko = CoinGeckoCollector()
+        self.metaculus = MetaculusCollector()
+        self.fear_greed = FearGreedCollector()
+        self.fred = FREDCollector()
+        self.finnhub = FinnhubCollector()
         self.signals = SignalGenerator()
         self.risk = RiskManager()
         self.portfolio = Portfolio()
@@ -121,10 +206,12 @@ class Orchestrator:
         logger.info("── Step 1: Discovering markets ──")
 
         try:
-            markets = self.client.get_markets(limit=50, active=True)
+            # Fetch more candidates so tiered sorting has enough short-term markets
+            markets = self.client.get_markets(limit=100, active=True)
 
             # Filter for tradeable markets with decent liquidity
             filtered = []
+            skipped_category = 0
             for market in markets:
                 try:
                     volume = float(market.get("volume", 0) or 0)
@@ -147,14 +234,37 @@ class Orchestrator:
                     except (json.JSONDecodeError, ValueError, IndexError):
                         pass
 
+                # Skip sports match results and entertainment award markets
+                question_lower = market.get("question", "").lower()
+                if any(kw in question_lower for kw in SKIP_MARKET_KEYWORDS):
+                    skipped_category += 1
+                    continue
+
                 filtered.append(market)
 
-            # Take top 10 by volume
-            filtered.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)
-            filtered = filtered[:10]
+            # Tier markets by days until resolution — prioritize short-term.
+            # Short-term markets resolve quickly, giving fast calibration feedback.
+            #   Tier 1 (≤14 days):  weekly data releases, near-term events
+            #   Tier 2 (15-60 days): monthly events, near-term macro
+            #   Tier 3 (>60 days):  long-horizon markets (slowest feedback)
+            short_term  = [m for m in filtered if _days_until_resolution(m) <= 14]
+            medium_term = [m for m in filtered if 14 < _days_until_resolution(m) <= 60]
+            long_term   = [m for m in filtered if _days_until_resolution(m) > 60]
 
-            logger.info("Discovered %d tradeable markets (from %d total)", len(filtered), len(markets))
-            return {"markets": filtered}
+            # Sort each tier by volume (higher volume = more liquid, better data)
+            for tier in (short_term, medium_term, long_term):
+                tier.sort(key=lambda m: float(m.get("volume", 0) or 0), reverse=True)
+
+            # Fill 10 slots: short-term first, then medium, then long
+            selected = (short_term + medium_term + long_term)[:10]
+
+            logger.info(
+                "Discovered %d markets (short≤14d: %d, medium: %d, long: %d) "
+                "from %d total, %d skipped as sports/entertainment",
+                len(selected), len(short_term), len(medium_term), len(long_term),
+                len(markets), skipped_category,
+            )
+            return {"markets": selected}
 
         except Exception as e:
             logger.error("Market discovery failed: %s", e)
@@ -170,7 +280,6 @@ class Orchestrator:
             return {"articles": {}, "sentiment": {}}
 
         articles = {}
-        sentiment = {}
         errors = state.get("errors", [])
 
         # Fetch all sources independently — one failing shouldn't block the others
@@ -191,23 +300,164 @@ class Orchestrator:
             errors.append(str(e))
 
         try:
-            sentiment = self.sentiment.get_sentiment_for_markets(markets)
+            st_articles = self.stocktwits.get_sentiment_for_markets(markets)
+            for market_id, st_list in st_articles.items():
+                articles[market_id] = articles.get(market_id, []) + st_list
         except Exception as e:
-            logger.error("Reddit collection failed: %s", e)
+            logger.error("Stocktwits collection failed: %s", e)
             errors.append(str(e))
 
+        try:
+            trends_articles = self.trends.get_trends_for_markets(markets)
+            for market_id, trend_list in trends_articles.items():
+                articles[market_id] = articles.get(market_id, []) + trend_list
+        except Exception as e:
+            logger.error("Google Trends collection failed: %s", e)
+            errors.append(str(e))
+
+        try:
+            cg_articles = self.coingecko.get_price_context_for_markets(markets)
+            for market_id, cg_list in cg_articles.items():
+                articles[market_id] = articles.get(market_id, []) + cg_list
+        except Exception as e:
+            logger.error("CoinGecko collection failed: %s", e)
+            errors.append(str(e))
+
+        try:
+            meta_articles = self.metaculus.get_forecasts_for_markets(markets)
+            for market_id, meta_list in meta_articles.items():
+                articles[market_id] = articles.get(market_id, []) + meta_list
+        except Exception as e:
+            logger.error("Metaculus collection failed: %s", e)
+            errors.append(str(e))
+
+        try:
+            fg_articles = self.fear_greed.get_index_for_markets(markets)
+            for market_id, fg_list in fg_articles.items():
+                articles[market_id] = articles.get(market_id, []) + fg_list
+        except Exception as e:
+            logger.error("Fear & Greed collection failed: %s", e)
+            errors.append(str(e))
+
+        try:
+            fred_articles = self.fred.get_macro_data_for_markets(markets)
+            for market_id, fred_list in fred_articles.items():
+                articles[market_id] = articles.get(market_id, []) + fred_list
+        except Exception as e:
+            logger.error("FRED collection failed: %s", e)
+            errors.append(str(e))
+
+        try:
+            fh_news = self.finnhub.get_news_for_markets(markets)
+            for market_id, fh_list in fh_news.items():
+                articles[market_id] = articles.get(market_id, []) + fh_list
+        except Exception as e:
+            logger.error("Finnhub news collection failed: %s", e)
+            errors.append(str(e))
+
+        try:
+            fh_quotes = self.finnhub.get_quotes_for_markets(markets)
+            for market_id, fh_list in fh_quotes.items():
+                articles[market_id] = articles.get(market_id, []) + fh_list
+        except Exception as e:
+            logger.error("Finnhub quotes collection failed: %s", e)
+            errors.append(str(e))
+
+        # Deduplicate articles per market — same story can arrive from multiple sources
+        for market_id in articles:
+            articles[market_id] = _deduplicate_articles(articles[market_id])
+
+        # ── News-reaction gate: whale / informed-trading detection ──
+        #
+        # If a market shows unusual activity (sharp 1h price move OR high article
+        # count), prepend a synthetic alert article so Claude factors it into
+        # its probability estimate. This flags potential whale positioning or
+        # breaking news that hasn't fully propagated yet.
+        for market in markets:
+            mid = market.get("id", market.get("condition_id", "unknown"))
+            market_articles = articles.get(mid, [])
+            article_count = len(market_articles)
+
+            # oneHourPriceChange is a Gamma API extra field (float, may be absent)
+            try:
+                hour_change = float(market.get("oneHourPriceChange") or 0.0)
+            except (ValueError, TypeError):
+                hour_change = 0.0
+
+            significant_move = abs(hour_change) >= 0.15
+            high_coverage    = article_count >= 5
+
+            if significant_move or high_coverage:
+                signals = []
+                if significant_move:
+                    direction = "UP" if hour_change > 0 else "DOWN"
+                    signals.append(f"1h price moved {hour_change:+.0%} ({direction})")
+                if high_coverage:
+                    signals.append(f"high article count ({article_count} sources)")
+
+                note = (
+                    f"MARKET ACTIVITY ALERT: {'; '.join(signals)}. "
+                    f"This may indicate informed trading, whale positioning, or "
+                    f"a major breaking development. "
+                    f"Consider whether the market has already priced this in, "
+                    f"or whether the move is an overreaction."
+                )
+                alert = {
+                    "title": "Market Activity Alert: Unusual signals detected",
+                    "source": "Market Monitor",
+                    "description": note,
+                    "content": note,
+                    "url": "",
+                    "published_at": "",
+                }
+                articles[mid] = [alert] + market_articles
+                logger.info(
+                    "Whale alert for '%s': %s",
+                    market.get("question", mid)[:50], "; ".join(signals)
+                )
+
         total_articles = sum(len(v) for v in articles.values())
-        total_posts = sum(len(v) for v in sentiment.values())
 
         logger.info(
-            "Collected %d articles (NewsAPI + RSS) and %d Reddit posts for %d markets",
-            total_articles, total_posts, len(markets)
+            "Collected %d articles after dedup (NewsAPI + RSS + Stocktwits + Trends + "
+            "CoinGecko + Metaculus + Finnhub) for %d markets",
+            total_articles, len(markets)
         )
 
-        result = {"articles": articles, "sentiment": sentiment}
+        # Detect market regime from Fear & Greed index (already fetched above)
+        regime = self._detect_regime()
+
+        result = {"articles": articles, "sentiment": {}, "regime": regime}
         if errors:
             result["errors"] = errors
         return result
+
+    def _detect_regime(self) -> str:
+        """Detect current market regime from the Fear & Greed index.
+
+        Returns one of: extreme_fear, fear, neutral, greed, extreme_greed.
+        Falls back to 'neutral' if the index is unavailable.
+        """
+        value = self.fear_greed.get_current_value()
+        if value is None:
+            return "neutral"
+
+        if value <= 20:
+            regime = "extreme_fear"
+        elif value <= 40:
+            regime = "fear"
+        elif value <= 59:
+            regime = "neutral"
+        elif value <= 79:
+            regime = "greed"
+        else:
+            regime = "extreme_greed"
+
+        logger.info(
+            "Market regime: %s (Fear & Greed: %d/100)",
+            regime.upper().replace("_", " "), value
+        )
+        return regime
 
     def _generate_signals(self, state: AgentState) -> dict:
         """Node 3: Run FinBERT + Claude analysis, produce trading signals."""
@@ -243,7 +493,12 @@ class Orchestrator:
         logger.info("── Step 4: Evaluating risks ──")
 
         signals = state.get("signals", [])
+        regime = state.get("regime", "neutral")
         approved = []
+        # Track approvals within this batch so each subsequent check sees the
+        # correct position count. Without this, two signals evaluated at 9/8
+        # both pass, then both get executed, landing at 10 — one over the limit.
+        approved_this_cycle = 0
 
         for signal in signals:
             if signal.direction == "SKIP":
@@ -255,13 +510,18 @@ class Orchestrator:
                 confidence=signal.confidence,
                 bankroll=self.portfolio.total_value,
                 current_exposure=self.portfolio.total_exposure,
-                num_positions=self.portfolio.num_positions,
+                num_positions=self.portfolio.num_positions + approved_this_cycle,
                 current_drawdown=self.portfolio.drawdown_pct,
                 direction=signal.direction,
+                regime=regime,
+                resolution_type=signal.resolution_type,
+                resolution_clarity_score=signal.resolution_clarity_score,
+                spread=signal.spread,
             )
 
             if decision.approved:
                 approved.append((signal, decision))
+                approved_this_cycle += 1
                 logger.info(
                     "APPROVED: '%s' — $%.2f (%s)",
                     signal.question[:40], decision.position_size, signal.direction
@@ -287,6 +547,13 @@ class Orchestrator:
         results = []
 
         for signal, decision in approved:
+            # Safety guard: re-check live position count before each trade.
+            # Catches any edge case where the approved_this_cycle counter
+            # didn't account for something (e.g. a position opened externally).
+            if self.portfolio.num_positions >= MAX_CONCURRENT_POSITIONS:
+                logger.warning("Position limit reached mid-execution — skipping remaining trades")
+                break
+
             # Check kill switch before each individual trade (H-3)
             if self.risk.check_kill_switch():
                 logger.warning("Kill switch detected mid-cycle — cancelling remaining trades")
@@ -312,6 +579,13 @@ class Orchestrator:
                 price=price,
                 direction=signal.direction,
                 risk_decision=decision,
+                estimated_prob=signal.estimated_prob,
+                confidence=signal.confidence,
+                reasoning=signal.reasoning,
+                edge=signal.edge,
+                market_theme=signal.market_theme,
+                resolution_type=signal.resolution_type,
+                resolution_clarity_score=signal.resolution_clarity_score,
             ))
             results.append(result)
 
@@ -355,6 +629,12 @@ class Orchestrator:
                     exit_reason, pos.question[:40], pos.side, pos.current_price, won
                 )
                 self.portfolio.resolve_position(market_id, won=won)
+                try:
+                    asyncio.run(update_trade_outcome(
+                        market_id, outcome=1 if won else 0, exit_reason=exit_reason
+                    ))
+                except Exception as e:
+                    logger.warning("Failed to record resolved outcome for %s: %s", market_id, e)
             else:
                 # Stop loss or take profit — sell shares at market price
                 asyncio.run(self.executor.execute_exit(
@@ -435,6 +715,7 @@ class Orchestrator:
             "execution_results": [],
             "cycle_start": cycle_start,
             "errors": [],
+            "regime": "neutral",
         }
 
         try:

@@ -36,7 +36,7 @@ def make_orchestrator():
     """Create an Orchestrator with all external dependencies mocked out."""
     with patch("src.agent.orchestrator.PolymarketClient"), \
          patch("src.agent.orchestrator.NewsCollector"), \
-         patch("src.agent.orchestrator.SentimentScraper"), \
+         patch("src.agent.orchestrator.StocktwitsCollector"), \
          patch("src.agent.orchestrator.SignalGenerator"), \
          patch("src.agent.orchestrator.RiskManager"), \
          patch("src.trading.executor.PAPER_TRADING", True):

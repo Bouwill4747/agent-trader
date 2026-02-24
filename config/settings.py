@@ -21,8 +21,8 @@ POLYMARKET_API_SECRET = os.getenv("POLYMARKET_API_SECRET", "")
 POLYMARKET_API_PASSPHRASE = os.getenv("POLYMARKET_API_PASSPHRASE", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 NEWS_API_KEY = os.getenv("NEWS_API_KEY", "")
-REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "")
-REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "")
+FRED_API_KEY = os.getenv("FRED_API_KEY", "")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
 
 
 # === API Endpoints ===
@@ -43,15 +43,57 @@ CYCLE_INTERVAL_SECONDS = 3600  # 60 minutes
 
 KELLY_FRACTION = 0.25           # Use 25% of Kelly-recommended size
 MAX_POSITION_PCT = 0.05         # Max 5% of bankroll per market
-MAX_TOTAL_EXPOSURE_PCT = 0.50   # Max 50% of bankroll in open positions
-MAX_CONCURRENT_POSITIONS = 10
+MAX_TOTAL_EXPOSURE_PCT = 0.60   # Max 60% of bankroll in open positions
+MAX_CONCURRENT_POSITIONS = 12
 MAX_DRAWDOWN_PCT = 0.20         # Halt trading at 20% drawdown
 MIN_TRADE_SIZE = 1.0            # Polymarket minimum: $1
-MIN_EDGE_THRESHOLD = 0.10       # Only trade when edge > 10%
+MIN_SIGNAL_EDGE = 0.05          # Minimum edge to generate a signal (before spread cost)
+
+# === Market Category Filters ===
+# Markets whose questions match any keyword (case-insensitive) are skipped
+# at discovery. Avoids short-duration sports results and entertainment
+# awards where news analysis gives no real edge over the market.
+SKIP_MARKET_KEYWORDS = [
+    # Single-game date-specific sports results ("Will X win on 2026-02-21?")
+    "win on 20",
+    # Esports match formats (Best of 3 / Best of 5)
+    "bo3", "bo5",
+
+    # --- Major sports leagues ---
+    "nba", "nfl", "nhl", "mlb", "mls",
+    "nba finals", "super bowl", "world series", "stanley cup",
+
+    # --- Sports types ---
+    "basketball", "football game", "baseball game", "hockey game",
+    "tennis", "golf tournament", "cricket", "rugby",
+    "boxing match", "ufc", "mma fight",
+    "formula 1", "grand prix", "nascar",
+    "swimming", "gymnastics", "track and field",
+
+    # --- Sports award/outcome language ---
+    "most valuable player", "mvp award",
+    "most improved", "rookie of the year",
+    "all-star game", "slam dunk contest",
+    "playoff series", "championship series",
+    "win the championship", "win the title",
+    "advance to the finals", "reach the finals",
+
+    # --- Match-specific language ---
+    "match winner", "set winner", "game winner",
+    "beat ", "defeat ",  # "Will X beat Y" / "Will X defeat Y"
+
+    # --- Entertainment awards ---
+    "best actor", "best actress", "best director", "best picture",
+    "best film", "best supporting", "best animated",
+    "oscar", "oscars", "academy award",
+    "emmy", "grammy", "golden globe", "bafta",
+    "opening weekend box office",
+    "number one at the box office",
+]
 
 # === Exit Thresholds ===
 
-EXIT_STOP_LOSS_PCT = -0.40       # Exit when position is down 40%
+EXIT_STOP_LOSS_PCT = -0.25       # Exit when position is down 25%
 EXIT_RESOLVED_THRESHOLD = 0.95   # Price >= 0.95 or <= 0.05 = market resolved
 
 

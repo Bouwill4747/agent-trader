@@ -12,7 +12,7 @@ from src.data.polymarket_client import PolymarketClient
 from src.trading.portfolio import Portfolio
 from src.trading.risk_manager import RiskDecision
 from src.utils.logger import setup_logger
-from src.utils.db import insert_trade
+from src.utils.db import insert_trade, update_trade_outcome
 
 logger = setup_logger("executor")
 
@@ -60,6 +60,13 @@ class Executor:
         price: float,
         risk_decision: RiskDecision,
         direction: str = "BUY_YES",
+        estimated_prob: float = 0.0,
+        confidence: str = "",
+        reasoning: str = "",
+        edge: float = 0.0,
+        market_theme: str = "",
+        resolution_type: str = "",
+        resolution_clarity_score: int = 0,
     ) -> OrderResult:
         """Execute a trade based on a risk-approved decision.
 
@@ -107,6 +114,13 @@ class Executor:
                 "order_type": "GTC",
                 "status": "filled" if self.paper_mode else "pending",
                 "paper_trade": 1 if self.paper_mode else 0,
+                "claude_reasoning": reasoning or None,
+                "estimated_prob": estimated_prob or None,
+                "confidence": confidence or None,
+                "edge": edge or None,
+                "market_theme": market_theme or None,
+                "resolution_type": resolution_type or None,
+                "resolution_clarity_score": resolution_clarity_score or None,
             }
             await insert_trade(trade_record)
 
@@ -240,6 +254,13 @@ class Executor:
 
             # Close position in portfolio (restores cash, books PnL)
             self.portfolio.close_position(market_id, price)
+
+            # Record outcome on the original BUY trade for calibration tracking
+            outcome = 1 if reason == "TAKE_PROFIT" else 0  # STOP_LOSS → 0
+            try:
+                await update_trade_outcome(market_id, outcome=outcome, exit_reason=reason)
+            except Exception as e:
+                logger.warning("Failed to record trade outcome for %s: %s", market_id, e)
 
         return result
 
