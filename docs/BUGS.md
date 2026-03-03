@@ -187,14 +187,90 @@
 - **Fix**: Added `approved_this_cycle` counter in `_evaluate_risks()`. Each approval increments it, and it's added to `num_positions` for all subsequent checks in the same batch. Also added a live position count guard in `_execute_trades()` as a safety net — if the actual portfolio count is already at the limit, remaining approved trades are skipped.
 - **Lesson Learned**: When iterating over a batch of decisions that mutate shared state, you must track in-flight changes within the loop — not just read from the shared state once at the start. The same pattern can cause bugs in any loop that approves/allocates from a shared pool.
 
+### BUG-019: PolyApiException crashes cycle — minimum order size not caught
+- **Date**: 2026-02-25
+- **File(s)**: `src/data/polymarket_client.py`, `src/trading/risk_manager.py`
+- **Severity**: High
+- **Symptom**: Cycle crashed with `PolyApiException[status_code=400, error_message={'error': 'order ... is invalid. Size (4.65) lower than the minimum: 5'}]`. Risk manager log showed "5 shares" (due to `%.0f` rounding in format string) but actual value was 4.648.
+- **Root Cause**: Two issues: (1) `place_order()` in `polymarket_client.py` only caught `ConnectionError, TimeoutError, OSError, ValueError, KeyError` — `PolyApiException` (the CLOB SDK's own exception type) was not in the list and propagated up to crash the full cycle. (2) Polymarket CLOB requires a minimum of 5 shares per order, but the risk manager had no check for this — small bankrolls or high-priced tokens could produce valid-looking 4.x share positions.
+- **Fix**: (1) Added `PolyApiException` as the first except clause in `place_order()` so any CLOB rejection returns `None` rather than crashing. (2) Added a minimum-shares check in `risk_manager.py` after calculating `shares = position_size / effective_price` — if `shares < 5`, trade is rejected with a clear message before reaching the CLOB.
+- **Lesson Learned**: Always include the SDK's native exception type in your catch list, not just generic Python I/O errors. Format strings with `%.0f` hide precision — the actual float value can be different from what the log shows.
+
+---
+
+### BUG-020: GTC reconciliation marks partial fills as fully filled — orphans remaining open order
+- **Date**: 2026-02-26
+- **File(s)**: `src/agent/orchestrator.py`, `src/data/polymarket_client.py`
+- **Severity**: Medium
+- **Symptom**: Gold >$4,600 GTC order placed for ~30 shares at $0.11. Only 2 shares matched immediately. Reconciliation saw `balance = 2 ≥ 1`, declared the trade fully filled, marked DB status as `filled`, and stopped checking. The remaining ~28 shares sitting in the CLOB order book were never tracked again — invisible to the agent forever.
+- **Root Cause**: `_reconcile_gtc_orders()` used a single condition: `if balance >= 1 → mark filled`. It had no concept of partial fills — no check of whether an open order still existed for that token. In Polymarket's CLOB, a GTC order that partially fills stays in the book as "live" with reduced remaining size. The reconciliation had no visibility into this.
+- **Fix**: Added a call to `get_open_orders()` once per reconciliation run. Built a set of `token_ids` with active orders. Updated logic: if `balance ≥ 1` AND order still open → partial fill → update shares in tracker, keep status `pending`; if `balance ≥ 1` AND no open order → fully filled → update shares, mark `filled`; if `balance < 1` AND no open order → cancelled, mark `cancelled`. Changed `get_open_orders()` to return `None` on API failure (vs `[]`) so a failed fetch never incorrectly triggers "fully filled".
+- **Lesson Learned**: "Some tokens received" ≠ "order fully filled". Always check whether the order is still live in the book. Distinguish between `[]` (confirmed empty) and `None` (unknown) when polling external state — safe defaults should err toward doing less, not more.
+
+---
+
+### BUG-021: BUY_NO trades stored with negative edge — corrupts all calibration data
+- **Date**: 2026-02-28
+- **File(s)**: `src/trading/executor.py`
+- **Severity**: Critical
+- **Symptom**: 29/30 filled trades showed negative EV in the database. Calibration report claimed the agent had never had positive expected value on any trade.
+- **Root Cause**: `executor.py` stored `edge = signal.edge` unconditionally. `signal.edge = estimated_prob_yes - price_yes`. For a valid BUY_NO trade, `estimated_prob_yes < price_yes` (the market is overpriced), so `signal.edge` is negative — but the trade has POSITIVE edge from the NO side. The math: `edge_NO = price_YES - P̂(YES) = -signal.edge`. Storing the raw signal edge made all BUY_NO trades look like negative EV bets.
+- **Fix**: Compute `edge_for_side = edge if direction != "BUY_NO" else -edge` before writing to DB. Also added `market_price_yes` canonical column so analytics can always reconstruct edge from first principles.
+- **Lesson Learned**: Edge is direction-dependent. `estimated_prob - market_price` is only correct for BUY_YES. For BUY_NO, flip the sign. Always store the side-consistent edge, not the raw difference.
+
+### BUG-022: Intra-cycle exposure accumulator missing — cap can be breached
+- **Date**: 2026-02-28
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: Critical
+- **Symptom**: In a cycle with 3+ approved signals, all exposure checks used `self.portfolio.total_exposure` (the pre-cycle snapshot). Each check saw the same stale number. Three 15% positions could all pass a 50% cap check simultaneously, landing at 95% exposure.
+- **Root Cause**: The FIA standard requires pre-trade limits to "include working orders and all pending approvals." The code had `approved_this_cycle` for position count but no equivalent for dollar exposure.
+- **Fix**: Added `committed_exposure = self.portfolio.total_exposure` before the approval loop. Incremented by `decision.position_size` on each approval. Each subsequent check receives the updated total as `current_exposure`.
+- **Lesson Learned**: Per-trade limit checks are not enough when multiple trades are evaluated in a batch. Always track an accumulator that includes all in-cycle approvals. This mirrors standard institutional pre-trade risk controls.
+
+### BUG-023: SELL GTC not fill-confirmed — phantom cash in live mode
+- **Date**: 2026-02-28
+- **File(s)**: `src/trading/executor.py`, `src/agent/orchestrator.py`
+- **Severity**: High
+- **Symptom**: In live mode, `execute_exit()` called `portfolio.close_position()` immediately after placing a SELL order. Tokens are still held until the GTC SELL fills. Result: portfolio tracker showed cash that didn't exist, and tokens were orphaned in the CLOB.
+- **Root Cause**: Paper mode and live mode had different fill semantics. Paper exits fill instantly. Live GTC SELLs rest in the book until matched. The code treated both identically.
+- **Fix**: `execute_exit()` now calls `portfolio.mark_selling()` for live mode instead of `close_position()`. Position stays tracked with `selling_pending=True`. New `_reconcile_sell_orders()` method runs each cycle, checks CLOB balance, and calls `close_position()` only when balance drops to 0 (tokens gone = order filled).
+- **Lesson Learned**: Every exit order type has a fill latency. GTC SELLs are no different from GTC BUYs — order acknowledgement ≠ fill. Mirror the same reconciliation loop used for BUY orders.
+
+### BUG-024: LLM anchors on market price in prompt — near-zero edge estimates
+- **Date**: 2026-02-28
+- **File(s)**: `src/analysis/llm_researcher.py`
+- **Severity**: High
+- **Symptom**: 0/10 win rate on live trades. Reviewing logs showed Claude's probability estimates clustered tightly around the market price (~±5%). Edge was consistently near zero. The agent rarely found tradeable signals.
+- **Root Cause**: `ANALYSIS_TEMPLATE` included `## Current Market Price: $X.XX (market estimates Y% probability of YES)`. Anchoring bias research (ScienceDirect 2024, tested on GPT-4, Claude 2, Gemini, GPT-3.5) confirms all LLMs show statistically significant anchoring on numbers shown in the prompt, even when instructed to ignore them.
+- **Fix**: Removed the entire `## Current Market Price` section from `ANALYSIS_TEMPLATE`. Updated system prompt to explicitly state "You do NOT receive the current market price — estimate from evidence alone." `_default_response` now returns 0.5 (maximum uncertainty) instead of the market price, so failures are visible in logs.
+- **Lesson Learned**: If you ask an LLM to estimate a value and give it the "answer" first, it anchors on the answer. The independent estimate step and the market comparison step must be fully separated. Failing loudly (0.5 → near-zero edge → rejected) is better than failing silently (price → zero edge → no logs).
+
+### BUG-025: Position purged as phantom on SELL order failure
+- **Date**: 2026-03-03
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: Critical
+- **Symptom**: Labour leadership election NO position (18.1 shares, worth $10.31, +159%) was silently deleted from the portfolio tracker. Agent reported the position as "phantom — GTC order never filled." The tokens existed on-chain and the position was a real winner.
+- **Root Cause**: In `_monitor_positions()`, when `execute_exit()` returned `success=False`, the code unconditionally called `portfolio.purge_position()` with the comment "SELL failed — we don't actually hold these tokens." This logic was wrong: the SELL was rejected because the position had only 3 tracked shares (below the CLOB 5-share minimum), not because the tokens didn't exist. The actual on-chain balance was 18.1 shares. A failed SELL ≠ a phantom position.
+- **Fix**: Replaced the automatic purge with `_purge_if_balance_zero()`, a helper that calls `client.get_token_balance()` first. Only purges if balance < 1 (confirmed empty). If balance ≥ 1: keeps the position and logs a warning. If the API returns None (error): keeps the position and retries next cycle. Paper mode always purges (no CLOB to check). Applied to both the `if not result.success` branch and the `except Exception` branch.
+- **Lesson Learned**: A failed exit order is not proof that the position is fake. The CLOB can reject SELLs for many reasons (minimum size, liquidity, network error). Always verify on-chain state before deleting a position. Token balance = 0 is the only reliable phantom signal.
+
+### BUG-026: RESOLVED detection fires on price proximity, not actual settlement
+- **Date**: 2026-03-03
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: High
+- **Symptom**: "Will there be no change in Fed interest rates after the March 2026 meeting?" was exited as `RESOLVED_YES` on 2026-02-26 — weeks before the March FOMC meeting. The market had only moved to 97% YES (strong consensus), not actually settled. Tokens remained on-chain and Polymarket still showed the position open.
+- **Root Cause**: `_check_exit()` treated price >= 0.95 or price <= 0.05 as resolved. With `EXIT_RESOLVED_THRESHOLD = 0.95`, a NO token at 2.6¢ triggered `current_price <= (1 - 0.95) = 0.05`. A pre-resolution market can easily reach 97% consensus without settling. The agent confused "market has strong opinion" with "market has settled."
+- **Fix**: Added Gamma API confirmation in `_monitor_positions()` before acting on a RESOLVED signal. When `_check_exit()` returns RESOLVED, `get_market_by_id()` is called to check the `closed` flag. If `closed == False`: hold, log debug. If `closed == True`: proceed with resolution. If API returns None: hold and retry next cycle. `_check_exit()` itself is unchanged — it is still a fast price-based first filter.
+- **Lesson Learned**: Price proximity is a hint, not a fact. On Polymarket, a market can trade at 98% YES for days or weeks before officially resolving. The only authoritative source for market settlement is the Gamma API `closed` field. Never book a realized outcome without checking it.
+
 ---
 
 ## Stats
 
 | Metric | Count |
 |--------|-------|
-| Total bugs | 18 |
-| Critical | 5 |
-| High | 6 |
-| Medium | 5 |
+| Total bugs | 26 |
+| Critical | 8 |
+| High | 10 |
+| Medium | 6 |
 | Low | 2 |

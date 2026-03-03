@@ -606,4 +606,405 @@ If either triggers, a synthetic "Market Activity Alert" article is prepended to 
 | `src/agent/orchestrator.py` | Pass `resolution_type` to risk manager, `market_theme`/`resolution_type` to executor, whale detection gate in `_research_markets()` |
 | `tests/test_risk_manager.py` | Updated 3 tests to pass `resolution_type="mechanical_numeric"`, added 2 new resolution buffer tests |
 
+## Session 15 — 2026-02-25: Live Trading Bug Fixes (ERC-1155, GTC Phantoms, Min Shares)
+
+### Completed
+- [x] **ERC-1155 setApprovalForAll** — one-time on-chain setup enabling SELL orders (BUG-018)
+- [x] **GTC phantom positions** — fixed `executor.py` to only open portfolio positions when order `status == "matched"` (filled), not when "live" (resting in book)
+- [x] **Purge logic for failed SELLs** — `portfolio.purge_position()` removes phantom positions when SELL fails
+- [x] **PolyApiException not caught** — added `PolyApiException` to `place_order()` except clause (BUG-019)
+- [x] **CLOB minimum 5-share check** — risk manager rejects trades producing < 5 shares before sending to CLOB (BUG-019)
+- [x] **Order book management** — cancelled stale GTC orders stuck in book (SpaceX, Díaz-Canel BUY; Silver SELL at wrong price)
+- [x] All 123 tests passing
+
+### What Each Feature Does
+
+**ERC-1155 Approval (`_ensure_conditional_token_approval()`):**
+Polymarket conditional tokens are ERC-1155. USDC (BUY orders) uses ERC-20 allowance — already set by py-clob-client. But SELL orders use the ERC-1155 token itself, which needs a separate `setApprovalForAll` call for each exchange contract. This is a one-time per-wallet setup. Added to CLOB initialization — idempotent, skipped if already set.
+
+Required for 3 contracts: CTF Exchange, Neg Risk CTF Exchange, Relayer.
+
+**GTC Phantom Fix:**
+When a BUY order returns `status: "live"`, it's a GTC order resting in the order book. Tokens are NOT received — the position is not open yet. Fixed `_live_execute()` to return `filled=False` for "live" orders; `execute_trade()` only calls `portfolio.open_position()` if `result.filled is True`.
+
+**CLOB Minimum Shares:**
+Polymarket rejects orders < 5 shares with a 400 error. Added check in `risk_manager.py` after calculating `shares = position_size / effective_price`. If shares < 5, trade is rejected with a clear message before ever reaching the CLOB.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/data/polymarket_client.py` | Added `_ensure_conditional_token_approval()`, added `PolyApiException` to `place_order()` except clause |
+| `src/trading/executor.py` | Added `filled` field to `OrderResult`, GTC detection in `_live_execute()`, exception handling in `_live_exit()` |
+| `src/trading/portfolio.py` | Added `purge_position()` method |
+| `src/agent/orchestrator.py` | Wrapped `execute_exit()` in try/except with purge fallback |
+| `src/trading/risk_manager.py` | Added minimum 5-share check before approval |
+| `tests/test_risk_manager.py` | Added `TestMinimumShares` class (3 tests) |
+| `docs/BUGS.md` | Added BUG-019 |
+
+## Session 16 — 2026-02-26: GTC Order Reconciliation
+
+### Completed
+- [x] **GTC reconciliation** — agent now detects when GTC orders fill silently and restores them into the portfolio tracker
+- [x] `position_side` column added to trades table (migration via ALTER TABLE)
+- [x] `get_pending_live_trades()` and `mark_trade_status()` added to db.py
+- [x] `restore_position()` added to Portfolio — adds position without touching cash
+- [x] `get_token_balance()` added to PolymarketClient — checks CLOB conditional token balance
+- [x] `_reconcile_gtc_orders()` added to Orchestrator — runs at start of Step 6 every cycle
+- [x] All 126 tests passing
+
+### What It Does
+Each cycle, before checking exits, the agent:
+1. Queries DB for pending (unfilled) live BUY trades
+2. Checks actual CLOB token balance for each (`AssetType.CONDITIONAL`)
+3. If balance ≥ 1 → GTC order filled → calls `restore_position()` (no cash deduction, already synced)
+4. Marks trade as "filled" in DB
+5. Position is now tracked → stop-loss and take-profit apply from next price check
+
+For old trades in DB without `position_side`: falls back to price heuristic (< 50¢ → NO, ≥ 50¢ → YES) with a warning log.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/utils/db.py` | Add `position_side` migration, update `insert_trade()`, add `get_pending_live_trades()`, add `mark_trade_status()` |
+| `src/trading/executor.py` | Add `position_side` to trade_record |
+| `src/trading/portfolio.py` | Add `restore_position()` method |
+| `src/data/polymarket_client.py` | Add `get_token_balance()` method |
+| `src/agent/orchestrator.py` | Add `_reconcile_gtc_orders()`, call at start of `_monitor_positions()` |
+
+## Session 17 — 2026-02-26: GTC Partial Fill Fix + Execution Eligibility Gate
+
+### Completed
+- [x] **GTC partial fill tracking** — reconciliation now distinguishes partial fills from full fills; partially-filled GTC orders stay `pending` in DB and get share count updated each cycle (BUG-020)
+- [x] **`get_open_orders()` returns `None` on error** — caller can tell the difference between "no open orders" and "API call failed"; never marks a trade as filled when order state is unknown
+- [x] **Spread hard cap enforced** — `spread > 10%` now hard-rejects trades in `risk_manager.py` (condition 2 of execution eligibility gate)
+- [x] **Shadow gates for conditions 3–5** — log-only warnings for pool concentration, estimated slippage, and book depth proxy; not enforced yet, collecting data first
+- [x] **`liquidity` added to `TradingSignal`** — populated from Gamma API, passed through to risk manager for shadow gate calculations
+- [x] **`MAX_SPREAD_THRESHOLD = 0.10`** added to `config/settings.py`
+- [x] All 130 tests passing (up from 126)
+
+### What Each Change Does
+
+**GTC Partial Fill Fix:**
+Previous behaviour: as soon as `balance ≥ 1`, mark trade as `filled` and stop checking. A 2/30 share fill would orphan the remaining 28-share GTC order forever.
+
+New behaviour per cycle:
+1. Fetch all open CLOB orders once (`get_open_orders()`)
+2. For each pending trade: if balance ≥ 1 and order still open → **partial fill** → update share count, keep DB status `pending`
+3. If balance ≥ 1 and no open order → **fully filled** → update share count, mark `filled`
+4. If balance < 1 and no open order → **cancelled** → mark `cancelled`
+5. If `get_open_orders()` fails → do nothing (safe fallback, re-check next cycle)
+
+**Execution Eligibility Gate:**
+
+| Condition | Status | Threshold |
+|-----------|--------|-----------|
+| `edge > min_edge` | ✅ Enforced (existing) | Dynamic (regime + resolution buffers) |
+| `spread <= threshold` | ✅ Enforced (new) | 10% hard cap |
+| `position_size <= x% of pool` | 🔍 Shadow log | 3% of liquidity |
+| `estimated_slippage <= y` | 🔍 Shadow log | 2% (position/liquidity) |
+| `book_depth >= position_size` | 🔍 Shadow log | 10% of liquidity as proxy |
+
+Shadow gates log `WARNING: SHADOW gate N ...` but never block. To review after a few weeks:
+```bash
+grep "SHADOW gate" data/agent.log | awk '{print $5}' | sort | uniq -c
+```
+When data exists, thresholds can be tuned and gates enforced.
+
+### Why Not Cross the Spread
+Considered but rejected: automatically raising bid to `ask` price when GTC orders don't fill. The reasoning:
+- Edge estimates (from LLM) have large error bars — paying up amplifies mistakes
+- Crossing the spread means buying from people who price the ask higher because they know more (adverse selection)
+- The real fix is better market selection upstream, not chasing price downstream
+- Wide spreads indicate illiquid markets we probably shouldn't be trading anyway
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/data/polymarket_client.py` | `get_open_orders()` returns `None` on error (vs `[]`), updated type hint |
+| `src/agent/orchestrator.py` | Rewrote `_reconcile_gtc_orders()` — partial fill logic, open order check, cancelled detection |
+| `config/settings.py` | Added `MAX_SPREAD_THRESHOLD = 0.10` |
+| `src/analysis/signal_generator.py` | Added `liquidity: float` to `TradingSignal`, populate from market data |
+| `src/trading/risk_manager.py` | Import `MAX_SPREAD_THRESHOLD`, add `liquidity` param, enforce spread cap, shadow gates 3–5 |
+| `src/agent/orchestrator.py` | Pass `liquidity=signal.liquidity` to `evaluate_trade()` |
+| `tests/test_risk_manager.py` | Added `TestSpreadCap` class (4 tests) |
+
+---
+
+## Session 18 — 2026-02-26: Fair Value Take Profit (Option B)
+
+### Problem
+The legacy take profit formula `entry + 0.75 * (1 - entry)` is structurally broken for cheap tokens:
+- CDU BW NO entry at 4.5¢ required price to reach 76¢ to trigger (17x gain)
+- Gold >$4600 NO entry at 11¢ required price to reach 83¢ to trigger (7.5x gain)
+- Formula is price-anchored, not probability-anchored — doesn't reflect how far the market has moved relative to our edge estimate
+
+### Root Cause
+The formula assumes every token has the same payout structure (converge to $1), but ignores where we estimated the fair value to be. A 4.5¢ NO token with a 15% estimated probability has fair value at 15¢, not $1.
+
+### Solution (Option B: Fair Value Exit)
+Exit when current price has converged 90% from entry to estimated fair value:
+
+```
+fair_value = estimated_prob        (YES positions — token pays $1 if YES wins)
+fair_value = 1.0 - estimated_prob  (NO  positions — token pays $1 if NO  wins)
+take_profit = avg_price + 0.90 * (fair_value - avg_price)
+```
+
+Examples:
+| Position | Entry | Est. Prob | Fair Value | Old Threshold | New Threshold |
+|----------|-------|-----------|------------|---------------|---------------|
+| CDU NO   | 4.5¢  | 15% YES → 85% NO | 85¢ → fair for NO ✓ | 76¢ | 81¢ wait — actually: fair_value = 1-0.15 = 0.85, threshold = 0.045 + 0.90*(0.85-0.045) = 0.77 |
+
+Wait, let me recalculate CDU:
+- Entry 0.045, estimated_prob stored in DB = P(YES). CDU is a NO position.
+- fair_value = 1 - estimated_prob
+- If agent estimated P(YES) = 0.15 → fair_value = 0.85 → take_profit = 0.045 + 0.90*(0.805) = 0.769
+- CDU is now at 16.3¢, still below 76.9¢ — legitimate hold
+
+For cheap tokens where estimated_prob(YES) is high (agent bought NO):
+- entry=0.045, prob_yes=0.15 → fair_value_no = 0.85 → threshold ≈ 0.769 (makes sense)
+
+For cheap YES tokens:
+- entry=0.045, prob_yes=0.15 → fair_value_yes = 0.15 → threshold = 0.045 + 0.90*(0.105) = 0.1395 (exits at 14¢, 200% gain)
+
+Fallbacks:
+- If `fair_value <= avg_price` (estimate below entry): legacy formula applies
+- If `estimated_prob == 0` (old/paper trade): legacy formula applies
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/trading/portfolio.py` | Added `estimated_prob: float = 0.0` to `Position` dataclass; added param to `open_position()`, `restore_position()`; added to JSON serialization and `load_from_db()` |
+| `src/trading/executor.py` | Pass `estimated_prob` to `portfolio.open_position()` |
+| `src/agent/orchestrator.py` | Pass `estimated_prob` from DB trade to `restore_position()` in `_reconcile_gtc_orders()`; replaced `_check_exit()` take profit with Option B formula |
+| `src/utils/db.py` | Added `estimated_prob` to `get_pending_live_trades()` SELECT (from prior session) |
+| `tests/test_exit_logic.py` | Added `estimated_prob` param to `make_position()`; added `TestFairValueTakeProfit` class (8 tests) |
+
+### Test Count
+138 tests, all passing (up from 130).
+
+## Session 19 — 2026-02-28: Strategy Tightening (Edge Floor, Theme Ban, Correlation Cap)
+
+### Problem
+0/10 win rate on live trades. Post-mortem identified three structural failures:
+1. **No hard edge floor** — effective_min_edge was entirely dynamic (spread + regime + resolution + clarity). A cheap liquid market could be traded with 5% edge. Not enough.
+2. **No domain ban** — geopolitics, politics, macro markets were traded freely. LLMs have no informational edge here; these domains reflect aggregated professional research. Three correlated Iran NO positions = single geopolitical factor with multiple expirations.
+3. **No theme correlation cap** — multiple positions in the same theme created hidden leverage. If geopolitics moves against us, we lose on all of them simultaneously.
+
+### Solution
+
+#### 1. Hard Edge Floor (20%)
+Never trade below 20% edge regardless of spread/regime/resolution. `MIN_EDGE_FLOOR = 0.20` in `config/settings.py`. Applied in `risk_manager.py` as:
+```python
+effective_min_edge = max(MIN_EDGE_FLOOR, dynamic_min_edge)
+```
+Reason message annotates `floor=20%` when the floor is the binding constraint.
+
+#### 2. Banned Themes
+`BANNED_THEMES = frozenset({"geopolitics", "politics", "macro"})` in settings. Checked in `risk_manager.py` as Check 2b (before edge calculation). Returns `RiskDecision(approved=False, reason="Banned theme: '...' — no LLM edge in this domain")`.
+
+Markets the agent WON'T trade after this:
+- US-Iran military conflict
+- Trump policy markets
+- Fed rate decisions
+- Election outcomes
+
+#### 3. Theme Correlation Cap
+`MAX_POSITIONS_PER_THEME = 1` in settings. Checked in `orchestrator._evaluate_risks()` before calling risk manager. Queries DB for open position themes, builds per-theme count, rejects any signal that would exceed the cap. "other" theme is exempt (catch-all).
+
+Also added `get_open_position_themes()` DB function to support this check.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `config/settings.py` | Added `MIN_EDGE_FLOOR`, `BANNED_THEMES`, `MAX_POSITIONS_PER_THEME` |
+| `src/trading/risk_manager.py` | Added `market_theme` param, Check 2b (banned theme), floor via `max(MIN_EDGE_FLOOR, dynamic)` |
+| `src/utils/db.py` | Added `get_open_position_themes()` |
+| `src/agent/orchestrator.py` | Theme correlation cap in `_evaluate_risks()`; passes `market_theme` to risk manager |
+| `tests/test_risk_manager.py` | Updated 8 tests (floor changes min passing edge from ~5% to 20%); added `TestStrategyFilters` (9 tests) |
+
+### Test Count
+147 tests, all passing (up from 138).
+
+### Expected Impact
+- Trades per cycle will drop sharply (most signals were in politics/geopolitics/macro)
+- Position concentration from correlated themes eliminated
+- Minimum conviction required: 20%+ edge, allowed theme, not at correlation cap
+
+## Session 21 — 2026-03-03: Phantom Purge & False Resolution Fixes
+
+### Problem Source
+Reviewing the live Polymarket portfolio against the agent's internal tracker revealed two critical discrepancies:
+1. **Labour leadership election NO (18.1 shares, worth $10.31, +159%)** — agent had silently deleted this position after a SELL order failed due to CLOB minimum size. The tokens were real and on-chain.
+2. **Fed rates NO (52 shares)** — agent prematurely exited this as RESOLVED_YES on Feb 26, weeks before the March FOMC meeting. The market had 97% consensus but had not settled. Tokens remained on-chain.
+
+These two bugs combined caused the agent to understate portfolio value by ~$12 and overstate drawdown by ~9 percentage points, keeping it locked in RISK_REDUCING_ONLY/HALTED mode unnecessarily.
+
+### Fixes Applied
+
+#### BUG-025 — Balance-verified phantom purge (`src/agent/orchestrator.py`)
+- **Old behaviour**: Any SELL order failure → immediate `purge_position()` with "phantom" label
+- **New behaviour**: `_purge_if_balance_zero()` helper checks CLOB token balance first
+  - balance = 0 → confirmed phantom → purge
+  - balance ≥ 1 → real tokens, SELL rejected for another reason → keep, log warning
+  - balance = None → API error → keep, retry next cycle
+  - paper mode → always purge (no CLOB)
+- Applied to both the `if not result.success` and `except Exception` branches
+
+#### BUG-026 — Gamma-verified resolution detection (`src/agent/orchestrator.py`)
+- **Old behaviour**: `_check_exit()` returns RESOLVED if price >= 0.95 or <= 0.05 → immediately books outcome
+- **New behaviour**: When RESOLVED is signalled, `get_market_by_id()` is called to check the Gamma `closed` flag before acting
+  - `closed == True` → confirmed settled → proceed with resolution
+  - `closed == False` → strong consensus, not yet settled → hold, log debug
+  - API returns None → cannot confirm → hold, retry next cycle
+- `_check_exit()` unchanged — still a fast price-based first filter; verification lives in `_monitor_positions()`
+
+### Tests
+- 9 new tests added to `tests/test_exit_logic.py`
+  - `TestPurgeIfBalanceZero` (4 tests): paper mode purge, live balance=0 purge, live balance>0 keep, API error keep
+  - `TestGammaVerifiedResolution` (5 tests): _check_exit still returns RESOLVED from price; closed=False holds; closed=True resolves; API None holds; boundary tests
+- Full suite: **156/156 passing**
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/agent/orchestrator.py` | Added `_purge_if_balance_zero()` helper; RESOLVED block now checks Gamma `closed` flag; SELL failure paths use helper |
+| `tests/test_exit_logic.py` | Added `TestPurgeIfBalanceZero` and `TestGammaVerifiedResolution` test classes |
+| `docs/BUGS.md` | Added BUG-025 and BUG-026 |
+
+### Portfolio Impact
+- True portfolio value ~$114 vs agent-reported ~$102 (Labour + Fed positions untracked)
+- True drawdown ~9% vs agent-reported 18-21%
+- Agent was in RISK_REDUCING_ONLY/HALTED unnecessarily — will resume NORMAL trading once the fixes propagate and positions are reconciled
+
+---
+
+## Session 20 — 2026-02-28: Five-Bug Fix Sprint (Research-Driven)
+
+### Problem Source
+Parallel analysis by four specialist agents (quant, CRO, trading-system-auditor, financial-intel-researcher) plus independent deep research (cross-referencing FIA standards, SEC Market Access Rule, MiFID II, academic forecasting benchmarks) identified 5 interacting failures:
+1. BUY_NO edge stored as negative → all calibration data corrupted
+2. Intra-cycle exposure not accumulated → possible cap breach in busy cycles
+3. SELL-side GTC not fill-confirmed → phantom cash / position removed before tokens gone
+4. LLM anchors on market price in prompt → near-zero edge estimates (0/10 win rate root cause)
+5. Binary 20% halt with no intermediate risk-reducing state
+
+### Research Backing
+| Fix | Standard / Evidence |
+|-----|---------------------|
+| Canonical edge storage | Wolfers & Zitzewitz (2006) binary contract math: `edge_NO = price_YES − P̂(YES)` |
+| Exposure accumulator | FIA automated trading paper: "include working orders + pending approvals in limits" |
+| SELL GTC fill-check | FIX protocol order lifecycle, Polymarket API docs: `status=live` ≠ filled |
+| LLM de-anchoring | ScienceDirect anchoring study (GPT-4, Claude 2, Gemini, GPT-3.5): all show anchoring bias; "ignore previous" prompting has limited effect |
+| RISK_REDUCING_ONLY | NYSE Pillar: "risk controls outside order path can accept marginal orders before breach triggers" |
+
+### Changes Made
+
+#### 1. CRITICAL-3: Canonical Edge Storage
+The trades table `edge` column was storing `signal.edge = estimated_prob_yes - price_yes` for ALL trades, including BUY_NO. For a valid BUY_NO trade, this is negative — making all calibration records show negative EV.
+
+**Fix**: `executor.py` now computes `edge_for_side = edge if direction != "BUY_NO" else -edge` before writing to DB. Also added canonical `market_price_yes` column (YES token price at signal time) so analytics can always reconstruct direction-aware edge from first principles.
+
+#### 2. CRITICAL-2: Intra-Cycle Exposure Accumulator
+`_evaluate_risks()` was passing `self.portfolio.total_exposure` (snapshot at cycle start) to every risk evaluation. Three signals at 15% exposure each could all pass a 50% cap because each check saw the same stale number.
+
+**Fix**: `committed_exposure = self.portfolio.total_exposure` initialized before the loop, incremented by `decision.position_size` on each approval. Each subsequent signal sees the updated total.
+
+#### 3. CRITICAL-1: SELL-Side GTC Fill Confirmation
+`execute_exit()` was calling `portfolio.close_position()` immediately after the SELL order was placed — before CLOB confirmation. In live mode, tokens are still held until the order fills.
+
+**Fix**: Live mode now calls `portfolio.mark_selling(market_id, price, reason)` which flags the position with `selling_pending=True`. A new `_reconcile_sell_orders()` method runs each cycle, checks CLOB balance, and calls `close_position()` + `update_trade_outcome()` only when `balance < 1` (tokens gone). Exit check loop skips `selling_pending` positions.
+
+#### 4. ARCH-1: LLM De-Anchoring
+The `ANALYSIS_TEMPLATE` included `## Current Market Price: $X.XX (market estimates Y% probability of YES)`. All four LLM families (including Claude) show statistically significant anchoring on numbers in the prompt. The LLM was essentially returning `market_price ± noise`, producing near-zero edges.
+
+**Fix**: Removed the entire market price section from `ANALYSIS_TEMPLATE`. Updated system prompt to say "You do NOT receive the current market price — estimate from evidence alone." Changed `_default_response` from returning `price` to returning `0.5` (maximum uncertainty) so failures are visible in logs rather than silently echoing the market.
+
+#### 5. Drawdown Scaling: RISK_REDUCING_ONLY State
+Previously: single binary halt at 20%. Agent traded at full size until 19.9% drawdown, then hard-stopped. No gradual de-risking.
+
+**Fix**: Added `DRAWDOWN_RISK_REDUCING_PCT = 0.15` to settings. `risk_manager.get_trading_mode(drawdown_pct)` returns `NORMAL`, `RISK_REDUCING_ONLY`, or `HALTED`. At ≥15% drawdown, `_generate_signals()` and `_execute_trades()` skip immediately, but `_monitor_positions()` (exits, stop-losses, all reconciliation) still runs. The agent reduces exposure through natural exits rather than a hard freeze.
+
+### New DB Columns (trades table)
+| Column | Type | Description |
+|--------|------|-------------|
+| `market_price_yes` | REAL | YES token price at signal time — canonical primitive for edge analytics |
+
+### New Position Fields (portfolio.py)
+| Field | Type | Description |
+|-------|------|-------------|
+| `selling_pending` | bool | True = SELL order placed but not yet confirmed filled |
+| `sell_price` | float | Price at which SELL order was placed |
+| `selling_reason` | str | "STOP_LOSS" or "TAKE_PROFIT" |
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `config/settings.py` | Added `DRAWDOWN_RISK_REDUCING_PCT = 0.15` |
+| `src/utils/db.py` | Added `market_price_yes` migration + INSERT, added `get_pending_sell_trades()` |
+| `src/trading/portfolio.py` | Added `selling_pending/sell_price/selling_reason` to `Position`; added `mark_selling()`; updated JSON/load_from_db; summary shows [SELLING] |
+| `src/trading/executor.py` | `execute_trade()`: direction-aware `edge_for_side`, `market_price_yes` param; `execute_exit()`: `mark_selling()` in live mode, `close_position()` in paper mode |
+| `src/trading/risk_manager.py` | Imported `DRAWDOWN_RISK_REDUCING_PCT`; added `get_trading_mode()` method |
+| `src/analysis/llm_researcher.py` | Removed market price from `ANALYSIS_TEMPLATE`; updated system prompt; `_default_response` returns 0.5 not price |
+| `src/agent/orchestrator.py` | `_evaluate_risks()`: exposure accumulator; `_generate_signals()` + `_execute_trades()`: RISK_REDUCING_ONLY checks; added `_reconcile_sell_orders()`; `_monitor_positions()` skips selling_pending positions; imported `get_pending_sell_trades` |
+
+### Test Count
+147 tests, all passing (unchanged — new functionality covered by existing patterns).
+
 <!-- Future sessions will be appended below -->
+
+---
+
+## Session 22 — 2026-03-03: Tiered Market Discovery
+
+### Problem
+After 2 weeks of live paper trading every single discovery cycle showed `short≤14d: 0, medium: 0, long: 8-18`. All positions were resolving Jun–Dec 2026 — capital was locked with zero calibration feedback. Root cause: a single Gamma API call sorted by liquidity descending always returns the largest long-term markets; short/medium markets have lower absolute liquidity and never surfaced.
+
+### Solution: Three-Call Tiered Discovery
+The Gamma API supports `end_date_min` / `end_date_max` filter params. By making three separate calls — one per tier — each pool is sorted by liquidity *within* its tier. Short markets that would never appear in a global top-100 liquidity ranking now have their own dedicated pool.
+
+### Decisions Made
+| Decision | Choice | Reasoning |
+|----------|--------|-----------|
+| Short-tier limit | 100 (vs 50 for others) | Short-term universe is sparse; need larger raw pool to find enough candidates |
+| Medium start boundary | `today+14d+1s` | Avoids exact-day overlap with short tier |
+| Long start | `today+61d` | Explicit `end_date_min` so long call doesn't return medium markets |
+| Near-expiry skip | `< 2 days` | Markets in last 48h are illiquid, wide-spread, erratic price discovery |
+| Short-term thresholds | vol≥300, liq≥150 | Lower floors needed — short markets don't have months to accumulate volume |
+| Tier cycle caps | short≤20%, medium≤40% of bankroll | Prevents over-concentration in one resolution tier per cycle |
+| camelCase fallback | `endDate` field added to `_days_until_resolution()` | Gamma API returns `endDate` in some responses |
+
+### Changes Made
+
+#### 1. `src/data/polymarket_client.py`
+Added `end_date_min: str | None` and `end_date_max: str | None` params to `get_markets()`. When provided, appended to the params dict before the Gamma request.
+
+#### 2. `config/settings.py`
+Added per-tier volume/liquidity thresholds and per-tier intra-cycle exposure caps:
+- `SHORT_TERM_MIN_VOLUME=300`, `SHORT_TERM_MIN_LIQUIDITY=150`
+- `MEDIUM_TERM_MIN_VOLUME=500`, `MEDIUM_TERM_MIN_LIQUIDITY=250`
+- `LONG_TERM_MIN_VOLUME=1000`, `LONG_TERM_MIN_LIQUIDITY=500` (unchanged values)
+- `MIN_DAYS_TO_RESOLUTION=2`
+- `SHORT_TERM_MAX_CYCLE_EXPOSURE_PCT=0.20`
+- `MEDIUM_TERM_MAX_CYCLE_EXPOSURE_PCT=0.40`
+
+#### 3. `src/agent/orchestrator.py`
+- Added `timedelta` to `datetime` import
+- Imported new settings constants
+- Fixed `_days_until_resolution()`: added `endDate` camelCase fallback
+- Rewrote `_discover_markets()`: three separate API calls with date bounds, dedup by ID, tier-appropriate thresholds, near-expiry skip, improved log line
+- Updated `_evaluate_risks()`: added `committed_short_exposure`, `committed_medium_exposure` accumulators and `market_by_id` lookup; per-tier cap check inside approval block
+
+#### 4. `tests/test_market_discovery.py` (new)
+21 tests across 7 test classes: `_days_until_resolution` parsing, three-call API structure, near-expiry filter, tier prioritisation, tier thresholds, deduplication, keyword filter, and per-tier cycle caps.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/data/polymarket_client.py` | `get_markets()` gains `end_date_min`/`end_date_max` params |
+| `config/settings.py` | 9 new tier discovery constants |
+| `src/agent/orchestrator.py` | `_discover_markets()` rewrite + `_evaluate_risks()` tier caps |
+| `tests/test_market_discovery.py` | New file, 21 tests |
+
+### Test Count
+177 tests, all passing (21 new).

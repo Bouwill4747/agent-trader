@@ -16,7 +16,7 @@ blocking the main async event loop.
 import asyncio
 import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -25,6 +25,13 @@ from config.settings import (
     CYCLE_INTERVAL_SECONDS, KILL_SWITCH_PATH,
     EXIT_STOP_LOSS_PCT, EXIT_RESOLVED_THRESHOLD,
     SKIP_MARKET_KEYWORDS, MAX_CONCURRENT_POSITIONS,
+    PAPER_TRADING, MAX_POSITIONS_PER_THEME,
+    SHORT_TERM_MAX_DAYS, MEDIUM_TERM_MAX_DAYS,
+    SHORT_TERM_MIN_VOLUME, SHORT_TERM_MIN_LIQUIDITY,
+    MEDIUM_TERM_MIN_VOLUME, MEDIUM_TERM_MIN_LIQUIDITY,
+    LONG_TERM_MIN_VOLUME, LONG_TERM_MIN_LIQUIDITY,
+    MIN_DAYS_TO_RESOLUTION,
+    SHORT_TERM_MAX_CYCLE_EXPOSURE_PCT, MEDIUM_TERM_MAX_CYCLE_EXPOSURE_PCT,
 )
 from src.data.polymarket_client import PolymarketClient
 from src.data.news_collector import NewsCollector
@@ -41,7 +48,12 @@ from src.trading.risk_manager import RiskManager
 from src.trading.executor import Executor
 from src.trading.portfolio import Portfolio
 from src.utils.logger import setup_logger
-from src.utils.db import init_db, insert_agent_run, update_agent_run, update_trade_outcome
+from src.utils.db import (
+    init_db, insert_agent_run, update_agent_run, update_trade_outcome,
+    get_pending_live_trades, get_pending_sell_trades, mark_trade_status,
+    get_calibration_stats, get_trade_summary,
+    get_open_position_themes,
+)
 
 logger = setup_logger("orchestrator")
 
@@ -58,7 +70,9 @@ def _days_until_resolution(market: dict) -> int:
     Uses end_date_iso first, falls back to end_date.
     Returns 999 if the date is missing or unparseable (treated as long-term).
     """
-    date_str = market.get("end_date_iso") or market.get("end_date")
+    date_str = (market.get("end_date_iso")
+                or market.get("endDate")
+                or market.get("end_date"))
     if not date_str:
         return 999
     try:
@@ -71,6 +85,30 @@ def _days_until_resolution(market: dict) -> int:
         return max(0, (end - now).days)
     except (ValueError, TypeError):
         return 999
+
+
+# ──────────────────────────────────────────────
+# Market ID helper
+# ──────────────────────────────────────────────
+
+def _get_market_id(market: dict) -> str:
+    """Extract the canonical market ID, falling back to condition_id."""
+    return market.get("id") or market.get("condition_id", "")
+
+
+def _classify_market_tier(days: int) -> str:
+    """Classify a market into a resolution tier based on days to resolution.
+
+    Returns:
+        'short'  — resolves within SHORT_TERM_MAX_DAYS
+        'medium' — resolves within MEDIUM_TERM_MAX_DAYS
+        'long'   — resolves after MEDIUM_TERM_MAX_DAYS
+    """
+    if days <= SHORT_TERM_MAX_DAYS:
+        return "short"
+    elif days <= MEDIUM_TERM_MAX_DAYS:
+        return "medium"
+    return "long"
 
 
 # ──────────────────────────────────────────────
@@ -202,25 +240,75 @@ class Orchestrator:
     # ──────────────────────────────────────────────
 
     def _discover_markets(self, state: AgentState) -> dict:
-        """Node 1: Find active, liquid markets on Polymarket."""
+        """Node 1: Find active, liquid markets on Polymarket.
+
+        Three separate API calls — one per resolution tier — so each pool is
+        sorted by liquidity *within* its tier. A single liquidity-sorted call
+        always returns large long-term markets; short/medium-term markets never
+        appear unless we filter by end_date.
+        """
         logger.info("── Step 1: Discovering markets ──")
 
         try:
-            # Fetch more candidates so tiered sorting has enough short-term markets
-            markets = self.client.get_markets(limit=100, active=True)
+            today = datetime.now(timezone.utc)
+            fmt = lambda d: d.strftime("%Y-%m-%dT%H:%M:%SZ")
+            short_boundary = today + timedelta(days=SHORT_TERM_MAX_DAYS)
+            medium_start   = today + timedelta(days=SHORT_TERM_MAX_DAYS, seconds=1)  # no overlap at boundary
+            medium_end     = today + timedelta(days=MEDIUM_TERM_MAX_DAYS)
+            long_start     = today + timedelta(days=MEDIUM_TERM_MAX_DAYS + 1)        # explicitly >60d only
 
-            # Filter for tradeable markets with decent liquidity
-            filtered = []
+            short_candidates = self.client.get_markets(
+                limit=100,                          # larger pool — short-tier universe is sparse
+                end_date_min=fmt(today),
+                end_date_max=fmt(short_boundary),
+            )
+            medium_candidates = self.client.get_markets(
+                limit=50,
+                end_date_min=fmt(medium_start),
+                end_date_max=fmt(medium_end),
+            )
+            long_candidates = self.client.get_markets(
+                limit=50,
+                end_date_min=fmt(long_start),       # explicitly long-only (was unfiltered before)
+            )
+
+            # Deduplicate by market id across all three pools
+            seen_ids: set[str] = set()
+            all_candidates: list = []
+            for m in short_candidates + medium_candidates + long_candidates:
+                mid = _get_market_id(m)
+                if mid and mid not in seen_ids:
+                    seen_ids.add(mid)
+                    all_candidates.append(m)
+
+            # Filter for tradeable markets.
+            # Store (market, days) tuples so _days_until_resolution is called once per
+            # market here and not again during tier grouping below.
+            filtered: list[tuple[dict, int]] = []
             skipped_category = 0
-            for market in markets:
+            for market in all_candidates:
                 try:
                     volume = float(market.get("volume", 0) or 0)
                     liquidity = float(market.get("liquidity", 0) or 0)
                 except (ValueError, TypeError):
                     continue
 
-                # Skip low-liquidity markets (hard to trade, wide spreads)
-                if volume < 1000 or liquidity < 500:
+                days = _days_until_resolution(market)
+
+                # Skip markets resolving too soon — illiquid near expiry, poor price discovery
+                if days < MIN_DAYS_TO_RESOLUTION:
+                    continue
+
+                # Tier-appropriate thresholds — short-term markets have lower absolute volume
+                tier = _classify_market_tier(days)
+                if tier == "short":
+                    min_vol, min_liq = SHORT_TERM_MIN_VOLUME, SHORT_TERM_MIN_LIQUIDITY
+                elif tier == "medium":
+                    min_vol, min_liq = MEDIUM_TERM_MIN_VOLUME, MEDIUM_TERM_MIN_LIQUIDITY
+                else:
+                    min_vol, min_liq = LONG_TERM_MIN_VOLUME, LONG_TERM_MIN_LIQUIDITY
+
+                if volume < min_vol or liquidity < min_liq:
                     continue
 
                 # Skip already-resolved markets (price at $0 or $1)
@@ -240,16 +328,17 @@ class Orchestrator:
                     skipped_category += 1
                     continue
 
-                filtered.append(market)
+                filtered.append((market, days))
 
             # Tier markets by days until resolution — prioritize short-term.
             # Short-term markets resolve quickly, giving fast calibration feedback.
-            #   Tier 1 (≤14 days):  weekly data releases, near-term events
-            #   Tier 2 (15-60 days): monthly events, near-term macro
-            #   Tier 3 (>60 days):  long-horizon markets (slowest feedback)
-            short_term  = [m for m in filtered if _days_until_resolution(m) <= 14]
-            medium_term = [m for m in filtered if 14 < _days_until_resolution(m) <= 60]
-            long_term   = [m for m in filtered if _days_until_resolution(m) > 60]
+            #   Tier 1 (≤SHORT_TERM_MAX_DAYS):  weekly data releases, near-term events
+            #   Tier 2 (15–MEDIUM_TERM_MAX_DAYS): monthly events, near-term macro
+            #   Tier 3 (>MEDIUM_TERM_MAX_DAYS):  long-horizon markets (slowest feedback)
+            # Days already cached in the tuple — no re-parsing needed.
+            short_term  = [m for m, d in filtered if d <= SHORT_TERM_MAX_DAYS]
+            medium_term = [m for m, d in filtered if SHORT_TERM_MAX_DAYS < d <= MEDIUM_TERM_MAX_DAYS]
+            long_term   = [m for m, d in filtered if d > MEDIUM_TERM_MAX_DAYS]
 
             # Sort each tier by volume (higher volume = more liquid, better data)
             for tier in (short_term, medium_term, long_term):
@@ -260,9 +349,12 @@ class Orchestrator:
 
             logger.info(
                 "Discovered %d markets (short≤14d: %d, medium: %d, long: %d) "
-                "from %d total, %d skipped as sports/entertainment",
+                "from %d candidates (%d short, %d medium, %d long raw), "
+                "%d skipped as sports/entertainment",
                 len(selected), len(short_term), len(medium_term), len(long_term),
-                len(markets), skipped_category,
+                len(all_candidates),
+                len(short_candidates), len(medium_candidates), len(long_candidates),
+                skipped_category,
             )
             return {"markets": selected}
 
@@ -463,6 +555,16 @@ class Orchestrator:
         """Node 3: Run FinBERT + Claude analysis, produce trading signals."""
         logger.info("── Step 3: Generating signals ──")
 
+        # Skip signal generation in RISK_REDUCING_ONLY and HALTED modes.
+        # Only _monitor_positions() (exits, stop-losses, reconciliation) should run.
+        mode = self.risk.get_trading_mode(self.portfolio.drawdown_pct)
+        if mode != "NORMAL":
+            logger.warning(
+                "Trading mode: %s (drawdown %.1f%%) — skipping signal generation",
+                mode, self.portfolio.drawdown_pct * 100,
+            )
+            return {"signals": []}
+
         markets = state.get("markets", [])
         articles = state.get("articles", {})
         sentiment = state.get("sentiment", {})
@@ -499,17 +601,60 @@ class Orchestrator:
         # correct position count. Without this, two signals evaluated at 9/8
         # both pass, then both get executed, landing at 10 — one over the limit.
         approved_this_cycle = 0
+        # Running exposure accumulator — starts at current portfolio exposure and
+        # grows with each approval. Prevents intra-cycle overshoot of the 50% cap
+        # (FIA standard: limits must include working orders + pending approvals).
+        committed_exposure = self.portfolio.total_exposure
+        committed_short_exposure  = 0.0   # short-term new entries this cycle
+        committed_medium_exposure = 0.0   # medium-term new entries this cycle
+        total_value = self.portfolio.total_value
+
+        # Lookup table so we can classify each signal's tier without extra API calls
+        market_by_id = {
+            _get_market_id(m): m
+            for m in state.get("markets", [])
+        }
+
+        # Build per-theme counts from currently open positions for correlation cap.
+        # Filter by portfolio.positions to only count truly-tracked open positions.
+        open_themes = asyncio.run(get_open_position_themes())
+        theme_counts: dict[str, int] = {}
+        for market_id, theme in open_themes.items():
+            if market_id in self.portfolio.positions and theme:
+                theme_counts[theme] = theme_counts.get(theme, 0) + 1
+        # Track new approvals in this batch per theme
+        approved_theme_counts: dict[str, int] = {}
 
         for signal in signals:
             if signal.direction == "SKIP":
                 continue
+
+            # ── Pre-filter: Theme correlation cap ──
+            # Allow at most MAX_POSITIONS_PER_THEME open positions with the same theme.
+            # "other" is a catch-all — not capped. Empty theme is not capped.
+            signal_theme = signal.market_theme
+            if signal_theme and signal_theme != "other":
+                current_count = (
+                    theme_counts.get(signal_theme, 0)
+                    + approved_theme_counts.get(signal_theme, 0)
+                )
+                if current_count >= MAX_POSITIONS_PER_THEME:
+                    logger.info(
+                        "REJECTED: '%s' — theme '%s' correlation cap (%d/%d)",
+                        signal.question[:40], signal_theme,
+                        current_count, MAX_POSITIONS_PER_THEME,
+                    )
+                    continue
+
+            existing = self.portfolio.positions.get(signal.market_id)
+            market_exposure = existing.cost_basis if existing else 0.0
 
             decision = self.risk.evaluate_trade(
                 estimated_prob=signal.estimated_prob,
                 market_price=signal.current_price,
                 confidence=signal.confidence,
                 bankroll=self.portfolio.total_value,
-                current_exposure=self.portfolio.total_exposure,
+                current_exposure=committed_exposure,
                 num_positions=self.portfolio.num_positions + approved_this_cycle,
                 current_drawdown=self.portfolio.drawdown_pct,
                 direction=signal.direction,
@@ -517,11 +662,41 @@ class Orchestrator:
                 resolution_type=signal.resolution_type,
                 resolution_clarity_score=signal.resolution_clarity_score,
                 spread=signal.spread,
+                market_exposure=market_exposure,
+                liquidity=signal.liquidity,
+                market_theme=signal.market_theme,
             )
 
             if decision.approved:
+                # Per-tier intra-cycle exposure cap
+                mkt = market_by_id.get(signal.market_id, {})
+                tier = _classify_market_tier(_days_until_resolution(mkt))
+                if tier == "short":
+                    if committed_short_exposure + decision.position_size > total_value * SHORT_TERM_MAX_CYCLE_EXPOSURE_PCT:
+                        logger.info(
+                            "REJECTED (tier cap): '%s' — short-term cycle cap %.0f%% would be exceeded",
+                            signal.question[:40], SHORT_TERM_MAX_CYCLE_EXPOSURE_PCT * 100,
+                        )
+                        continue
+                elif tier == "medium":
+                    if committed_medium_exposure + decision.position_size > total_value * MEDIUM_TERM_MAX_CYCLE_EXPOSURE_PCT:
+                        logger.info(
+                            "REJECTED (tier cap): '%s' — medium-term cycle cap %.0f%% would be exceeded",
+                            signal.question[:40], MEDIUM_TERM_MAX_CYCLE_EXPOSURE_PCT * 100,
+                        )
+                        continue
+
                 approved.append((signal, decision))
                 approved_this_cycle += 1
+                committed_exposure += decision.position_size
+                if tier == "short":
+                    committed_short_exposure += decision.position_size
+                elif tier == "medium":
+                    committed_medium_exposure += decision.position_size
+                if signal_theme and signal_theme != "other":
+                    approved_theme_counts[signal_theme] = (
+                        approved_theme_counts.get(signal_theme, 0) + 1
+                    )
                 logger.info(
                     "APPROVED: '%s' — $%.2f (%s)",
                     signal.question[:40], decision.position_size, signal.direction
@@ -542,6 +717,12 @@ class Orchestrator:
         to minimize the window between kill switch activation and trade halt.
         """
         logger.info("── Step 5: Executing trades ──")
+
+        # Re-check mode here in case drawdown moved during this cycle's signal generation
+        mode = self.risk.get_trading_mode(self.portfolio.drawdown_pct)
+        if mode != "NORMAL":
+            logger.warning("Trading mode: %s — skipping trade execution", mode)
+            return {"execution_results": []}
 
         approved = state.get("approved_trades", [])
         results = []
@@ -586,6 +767,7 @@ class Orchestrator:
                 market_theme=signal.market_theme,
                 resolution_type=signal.resolution_type,
                 resolution_clarity_score=signal.resolution_clarity_score,
+                current_price_yes=signal.current_price,
             ))
             results.append(result)
 
@@ -598,9 +780,170 @@ class Orchestrator:
 
         return {"execution_results": results}
 
+    def _reconcile_gtc_orders(self) -> None:
+        """Detect GTC orders that filled (fully or partially) and track them.
+
+        GTC orders return status='live' when placed — executor correctly does NOT
+        open a portfolio position at that point. But the order may fill later, silently,
+        including partial fills where only some shares match.
+
+        Each cycle we:
+          1. Fetch all open CLOB orders (one call) to know which orders are still live.
+          2. For each pending trade, check how many tokens we actually hold.
+          3. If balance >= 1 and order still open  → partial fill: track current balance,
+             keep DB status 'pending' so we re-check next cycle.
+          4. If balance >= 1 and no open order     → fully filled: track final balance,
+             mark DB status 'filled'.
+          5. If balance < 1 and no open order      → order was cancelled with no fill:
+             mark DB status 'cancelled'.
+
+        We never mark 'filled' when we cannot determine open order state (API failure),
+        to avoid stopping tracking of a still-live partial fill.
+        """
+        if self.executor.paper_mode:
+            return
+
+        pending = asyncio.run(get_pending_live_trades())
+        if not pending:
+            return
+
+        # Fetch all open orders once — None means the API call failed.
+        # We distinguish None (unknown) from [] (confirmed no open orders).
+        open_orders = self.client.get_open_orders()
+        open_orders_known = open_orders is not None
+        open_token_ids: set[str] = set()
+        if open_orders_known:
+            for order in open_orders:
+                # py-clob-client returns token_id as 'asset_id'
+                tid = order.get("asset_id") or order.get("token_id", "")
+                if tid:
+                    open_token_ids.add(tid)
+
+        for trade in pending:
+            market_id = trade["market_id"]
+            token_id  = trade["token_id"]
+
+            # Check actual token balance on CLOB
+            balance = self.client.get_token_balance(token_id)
+            if balance is None:
+                continue  # Can't determine — skip this cycle
+
+            still_open = open_orders_known and token_id in open_token_ids
+
+            # No tokens and no open order → cancelled with no fill
+            if balance < 1 and open_orders_known and not still_open:
+                asyncio.run(mark_trade_status(trade["id"], "cancelled"))
+                logger.info(
+                    "GTC CANCELLED (no fill): '%s'",
+                    trade.get("question", "?")[:40],
+                )
+                continue
+
+            if balance < 1:
+                continue  # Still waiting to fill
+
+            # We have tokens — determine position side
+            position_side = trade.get("position_side")
+            if not position_side:
+                position_side = "NO" if trade["price"] < 0.50 else "YES"
+                logger.warning(
+                    "position_side missing for trade %d — inferred %s from entry price $%.3f",
+                    trade["id"], position_side, trade["price"],
+                )
+
+            if market_id in self.portfolio.positions:
+                # Already tracked — update share count if more shares filled since last cycle
+                existing = self.portfolio.positions[market_id]
+                if abs(existing.shares - balance) > 0.01:
+                    logger.info(
+                        "GTC partial fill update: '%s' %.2f → %.2f %s shares",
+                        trade.get("question", "?")[:40], existing.shares, balance, position_side,
+                    )
+                    existing.shares = balance
+            else:
+                # Not yet tracked — restore into portfolio
+                restored = self.portfolio.restore_position(
+                    market_id=market_id,
+                    token_id=token_id,
+                    question=trade.get("question", ""),
+                    side=position_side,
+                    shares=balance,       # actual balance, not original order size
+                    price=trade["price"], # original entry price for PnL tracking
+                    estimated_prob=trade.get("estimated_prob") or 0.0,
+                )
+                if restored:
+                    logger.info(
+                        "GTC RECONCILED: '%s' — %.2f %s shares @ $%.3f now tracked",
+                        trade.get("question", "?")[:40], balance, position_side, trade["price"],
+                    )
+
+            # Mark fully filled only when we're sure no open order remains.
+            # If open_orders fetch failed, keep 'pending' — better to re-check
+            # than to silently stop tracking a live partial fill.
+            if open_orders_known and not still_open:
+                asyncio.run(mark_trade_status(trade["id"], "filled"))
+
+    def _reconcile_sell_orders(self) -> None:
+        """Confirm GTC SELL order fills and close positions when tokens are gone.
+
+        When execute_exit() places a live SELL order it calls portfolio.mark_selling()
+        instead of close_position(), because the tokens are still held until the
+        order fills. This method checks CLOB token balance each cycle:
+
+          balance >= 1 → order still open (or partially filled) — keep waiting
+          balance < 1  → tokens gone → order filled → close position, book PnL
+
+        Skipped in paper mode (paper exits fill instantly in execute_exit).
+        """
+        if self.executor.paper_mode:
+            return
+
+        pending_sells = asyncio.run(get_pending_sell_trades())
+        if not pending_sells:
+            return
+
+        for trade in pending_sells:
+            market_id = trade["market_id"]
+            token_id = trade["token_id"]
+
+            balance = self.client.get_token_balance(token_id)
+            if balance is None:
+                continue  # CLOB API error — recheck next cycle
+
+            if balance >= 1:
+                continue  # Tokens still held — order not yet fully filled
+
+            # Tokens are gone: SELL filled. Close the position.
+            pos = self.portfolio.positions.get(market_id)
+            if pos and pos.selling_pending:
+                close_price = pos.sell_price or trade["price"]
+                sell_reason = pos.selling_reason or "STOP_LOSS"
+                outcome = 1 if sell_reason == "TAKE_PROFIT" else 0
+                self.portfolio.close_position(market_id, close_price)
+                try:
+                    asyncio.run(update_trade_outcome(
+                        market_id, outcome=outcome, exit_reason=sell_reason
+                    ))
+                except Exception as e:
+                    logger.warning("Failed to record outcome for %s: %s", market_id, e)
+                asyncio.run(mark_trade_status(trade["id"], "filled"))
+                logger.info(
+                    "SELL RECONCILED: '%s' — %.0f shares @ $%.3f (%s)",
+                    trade.get("question", "?")[:40], trade["size"],
+                    close_price, sell_reason,
+                )
+            elif not pos:
+                # Position already gone (e.g. resolved) — just mark the SELL trade filled
+                asyncio.run(mark_trade_status(trade["id"], "filled"))
+
     def _monitor_positions(self, state: AgentState) -> dict:
         """Node 6: Check existing positions, auto-exit when thresholds hit."""
         logger.info("── Step 6: Monitoring positions ──")
+
+        # Detect GTC orders that filled since last cycle
+        self._reconcile_gtc_orders()
+        # Confirm GTC SELL fills and close positions when tokens are gone
+        self._reconcile_sell_orders()
 
         # Update prices for all open positions
         prices = {}
@@ -614,16 +957,36 @@ class Orchestrator:
         # Check exit conditions for each position
         # Iterate over a copy since exits delete from the dict
         for market_id, pos in list(self.portfolio.positions.items()):
+            # Skip positions with a SELL already in-flight — _reconcile_sell_orders()
+            # will close them once the CLOB confirms the fill
+            if pos.selling_pending:
+                continue
             exit_reason = self._check_exit(pos, pos.current_price)
             if exit_reason is None:
                 continue
 
             if exit_reason.startswith("RESOLVED"):
-                # Market resolved — book the outcome directly
-                won = (
-                    (pos.side == "YES" and pos.current_price >= EXIT_RESOLVED_THRESHOLD) or
-                    (pos.side == "NO" and pos.current_price <= (1 - EXIT_RESOLVED_THRESHOLD))
-                )
+                # Verify via Gamma API that the market is actually closed before
+                # treating as resolved. Price near $0/$1 can happen pre-resolution
+                # when consensus is strong (e.g. 97% YES before the Fed meeting
+                # even occurs). Closing early locks in a loss needlessly. (BUG-026)
+                market_info = self.client.get_market_by_id(market_id)
+                if market_info is None:
+                    logger.warning(
+                        "RESOLVED signal for '%s' (price=%.3f) but Gamma "
+                        "unreachable — holding until confirmed",
+                        pos.question[:40], pos.current_price,
+                    )
+                    continue
+                if not market_info.get("closed", False):
+                    logger.debug(
+                        "RESOLVED signal for '%s' (price=%.3f) — market not "
+                        "closed yet, holding",
+                        pos.question[:40], pos.current_price,
+                    )
+                    continue
+                # Confirmed closed — market has settled
+                won = pos.current_price >= EXIT_RESOLVED_THRESHOLD
                 logger.info(
                     "EXIT [%s]: '%s' — side=%s, price=$%.3f, won=%s",
                     exit_reason, pos.question[:40], pos.side, pos.current_price, won
@@ -637,22 +1000,177 @@ class Orchestrator:
                     logger.warning("Failed to record resolved outcome for %s: %s", market_id, e)
             else:
                 # Stop loss or take profit — sell shares at market price
-                asyncio.run(self.executor.execute_exit(
-                    market_id=market_id,
-                    token_id=pos.token_id,
-                    question=pos.question,
-                    shares=pos.shares,
-                    price=pos.current_price,
-                    reason=exit_reason,
-                ))
+                try:
+                    result = asyncio.run(self.executor.execute_exit(
+                        market_id=market_id,
+                        token_id=pos.token_id,
+                        question=pos.question,
+                        shares=pos.shares,
+                        price=pos.current_price,
+                        reason=exit_reason,
+                    ))
+                    if not result.success:
+                        # SELL failed — verify balance before purging (BUG-025).
+                        # Failure can be CLOB minimum size, not a phantom position.
+                        self._purge_if_balance_zero(market_id, pos)
+                except Exception as e:
+                    logger.error("EXIT error for '%s': %s", pos.question[:40], e)
+                    self._purge_if_balance_zero(market_id, pos)
 
             # Save snapshot after each exit
             asyncio.run(self.portfolio.save_snapshot())
 
+        # Sync cash from CLOB so the tracker never drifts from the real wallet.
+        # Covers the gap between detecting a resolved win (price-based) and
+        # Polymarket actually completing the on-chain USDC redemption.
+        self._sync_cash_from_clob()
+
         # Log portfolio summary
         logger.info("\n%s", self.portfolio.summary())
 
+        # Log calibration report
+        self._log_calibration_report()
+
         return {}
+
+    def _purge_if_balance_zero(self, market_id: str, pos) -> None:
+        """Purge a position only when CLOB confirms no tokens are held.
+
+        In paper mode we always purge (no real CLOB to check).
+        In live mode we query the actual on-chain balance:
+          - balance = 0    → genuine phantom (GTC never filled) — purge
+          - balance >= 1   → tokens are real, SELL was rejected for another
+                             reason (e.g. size below CLOB minimum) — keep
+          - balance = None → API error — keep and retry next cycle
+        """
+        if PAPER_TRADING:
+            logger.warning(
+                "EXIT failed for '%s' — purging phantom position",
+                pos.question[:40],
+            )
+            self.portfolio.purge_position(market_id)
+            return
+
+        balance = self.client.get_token_balance(pos.token_id)
+        if balance is None:
+            logger.warning(
+                "EXIT failed for '%s' — CLOB balance unavailable, keeping position",
+                pos.question[:40],
+            )
+            return
+
+        if balance < 1:
+            logger.warning(
+                "EXIT failed for '%s' — CLOB balance=%.2f, purging phantom",
+                pos.question[:40], balance,
+            )
+            self.portfolio.purge_position(market_id)
+        else:
+            logger.warning(
+                "EXIT failed for '%s' — CLOB balance=%.2f (real tokens, "
+                "SELL rejected e.g. size below minimum). Keeping position.",
+                pos.question[:40], balance,
+            )
+
+    def _sync_cash_from_clob(self) -> None:
+        """Pull real USDC balance from CLOB and correct portfolio cash.
+
+        This is the single source of truth for how much money we can actually
+        spend.  It runs every cycle so any drift (won position not yet
+        redeemed, manual deposits/withdrawals) self-corrects within one hour.
+        Skipped in paper-trading mode (no real wallet).
+        """
+        if PAPER_TRADING:
+            return
+        try:
+            from py_clob_client.clob_types import BalanceAllowanceParams, AssetType
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self.client.clob.get_balance_allowance(params=params)
+            real_usdc = int(result.get("balance", 0)) / 1_000_000  # USDC has 6 decimals
+            drift = real_usdc - self.portfolio.cash
+            if abs(drift) > 0.01:   # ignore sub-cent rounding differences
+                logger.info(
+                    "Cash sync: tracker $%.2f → actual $%.2f (drift $%+.2f)",
+                    self.portfolio.cash, real_usdc, drift,
+                )
+                self.portfolio.cash = real_usdc
+        except Exception as e:
+            logger.warning("Cash sync failed — using tracker value: %s", e)
+
+    def _log_calibration_report(self) -> None:
+        """Log a calibration summary every cycle.
+
+        Shows whether Claude's probability estimates are predictive:
+        - Overall win rate vs avg estimated probability
+        - Edge on winners vs losers (are we finding real edge or noise?)
+        - Breakdown by confidence level (high/medium/low)
+
+        Only reports once ≥ 3 resolved live trades exist.
+        Confidence breakdown shown once ≥ 5 resolved trades exist.
+        """
+        MIN_TRADES = 3
+        try:
+            summary = asyncio.run(get_trade_summary())
+            total = summary.get("total") or 0
+            if total < MIN_TRADES:
+                logger.info(
+                    "Calibration: %d resolved trade(s) — need %d to report",
+                    total, MIN_TRADES,
+                )
+                return
+
+            wins          = int(summary.get("wins") or 0)
+            losses        = total - wins
+            win_rate      = summary.get("win_rate") or 0.0
+            stop_losses   = int(summary.get("stop_losses") or 0)
+            take_profits  = int(summary.get("take_profits") or 0)
+            resolved      = int(summary.get("resolved") or 0)
+            avg_prob_wins   = summary.get("avg_prob_wins")
+            avg_prob_losses = summary.get("avg_prob_losses")
+            avg_edge_wins   = summary.get("avg_edge_wins")
+            avg_edge_losses = summary.get("avg_edge_losses")
+
+            lines = [
+                "── Calibration Report ──",
+                f"  Closed trades : {total} total — {wins} wins / {losses} losses — win rate: {win_rate:.0%}",
+                f"  Exit reasons  : {stop_losses} stop-loss | {take_profits} take-profit | {resolved} resolved",
+            ]
+
+            if avg_prob_wins is not None or avg_prob_losses is not None:
+                pw = f"{avg_prob_wins:.0%}"  if avg_prob_wins  is not None else "n/a"
+                pl = f"{avg_prob_losses:.0%}" if avg_prob_losses is not None else "n/a"
+                lines.append(f"  Avg est. prob : wins={pw}  losses={pl}")
+
+            if avg_edge_wins is not None or avg_edge_losses is not None:
+                ew = f"{avg_edge_wins:.1%}"  if avg_edge_wins  is not None else "n/a"
+                el = f"{avg_edge_losses:.1%}" if avg_edge_losses is not None else "n/a"
+                lines.append(f"  Avg edge      : wins={ew}  losses={el}")
+
+            # Calibration check: are estimated probs close to actual win rates?
+            if avg_prob_wins is not None and win_rate > 0:
+                bias = win_rate - avg_prob_wins
+                bias_str = f"{'overconfident' if bias < 0 else 'underconfident'} by {abs(bias):.0%}"
+                lines.append(f"  Prob accuracy : win_rate={win_rate:.0%} vs avg_prob={avg_prob_wins:.0%} → {bias_str}")
+
+            # Confidence breakdown (only meaningful with more data)
+            if total >= 5:
+                conf_stats = asyncio.run(get_calibration_stats())
+                if conf_stats:
+                    lines.append("  By confidence :")
+                    for row in conf_stats:
+                        conf = row.get("confidence") or "unknown"
+                        t    = row.get("total", 0)
+                        wr   = row.get("win_rate") or 0.0
+                        ep   = row.get("avg_estimated_prob")
+                        ep_str = f"{ep:.0%}" if ep is not None else "n/a"
+                        lines.append(
+                            f"    {conf:6s}: {t} trade(s)  win={wr:.0%}  avg_prob={ep_str}"
+                        )
+
+            logger.info("\n".join(lines))
+
+        except Exception as e:
+            logger.warning("Calibration report failed: %s", e)
 
     def _check_exit(self, pos, current_price: float) -> str | None:
         """Check whether a position should be exited.
@@ -661,10 +1179,15 @@ class Orchestrator:
             Exit reason string, or None to hold.
         """
         # --- Resolved market detection ---
+        # current_price is the price of the token we HOLD (YES price for YES
+        # positions, NO price for NO positions). Near $1 = our token wins;
+        # near $0 = our token is worthless (opposite side won).
         if current_price >= EXIT_RESOLVED_THRESHOLD:
-            return "RESOLVED_YES"
+            # Our token is worth ~$1 — identify the market outcome by side
+            return "RESOLVED_YES" if pos.side == "YES" else "RESOLVED_NO"
         if current_price <= (1 - EXIT_RESOLVED_THRESHOLD):
-            return "RESOLVED_NO"
+            # Our token is worth ~$0 — opposite outcome
+            return "RESOLVED_NO" if pos.side == "YES" else "RESOLVED_YES"
 
         # --- Stop loss ---
         if pos.cost_basis > 0:
@@ -672,10 +1195,23 @@ class Orchestrator:
             if pnl_pct <= EXIT_STOP_LOSS_PCT:
                 return "STOP_LOSS"
 
-        # --- Take profit ---
-        # Both YES and NO tokens pay $1 if they win. current_price tracks
-        # the token we hold, so profit = price moving toward $1 in both cases.
-        take_profit_price = pos.avg_price + 0.75 * (1.0 - pos.avg_price)
+        # --- Take profit (Option B: probability-anchored fair value exit) ---
+        # fair_value is what the token should be worth if our probability estimate
+        # is correct at resolution time:
+        #   YES token pays $1 if YES wins → fair_value = estimated_prob
+        #   NO  token pays $1 if NO  wins → fair_value = 1.0 - estimated_prob
+        # We exit when current_price has converged 90% from entry to fair value.
+        # Fallback: legacy 75%-to-$1 formula for positions without an estimate.
+        if pos.estimated_prob > 0:
+            fair_value = pos.estimated_prob if pos.side == "YES" else (1.0 - pos.estimated_prob)
+            if fair_value > pos.avg_price:
+                take_profit_price = pos.avg_price + 0.90 * (fair_value - pos.avg_price)
+            else:
+                # Estimated fair value at or below entry — no upside; use legacy fallback
+                take_profit_price = pos.avg_price + 0.75 * (1.0 - pos.avg_price)
+        else:
+            # No probability stored (old trade or paper trade) — legacy formula
+            take_profit_price = pos.avg_price + 0.75 * (1.0 - pos.avg_price)
         if current_price >= take_profit_price:
             return "TAKE_PROFIT"
 

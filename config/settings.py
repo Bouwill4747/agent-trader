@@ -42,12 +42,18 @@ CYCLE_INTERVAL_SECONDS = 3600  # 60 minutes
 # === Risk Limits ===
 
 KELLY_FRACTION = 0.25           # Use 25% of Kelly-recommended size
-MAX_POSITION_PCT = 0.05         # Max 5% of bankroll per market
+MAX_POSITION_PCT = 0.05         # Max 5% of bankroll per single trade
+MAX_MARKET_EXPOSURE_PCT = 0.15  # Max 15% of bankroll in any single market (across all adds)
 MAX_TOTAL_EXPOSURE_PCT = 0.60   # Max 60% of bankroll in open positions
 MAX_CONCURRENT_POSITIONS = 12
-MAX_DRAWDOWN_PCT = 0.20         # Halt trading at 20% drawdown
+MAX_DRAWDOWN_PCT = 0.20         # Full halt at 20% drawdown
+DRAWDOWN_RISK_REDUCING_PCT = 0.15  # Enter RISK_REDUCING_ONLY (exits only) at 15% drawdown
 MIN_TRADE_SIZE = 1.0            # Polymarket minimum: $1
 MIN_SIGNAL_EDGE = 0.05          # Minimum edge to generate a signal (before spread cost)
+MAX_SPREAD_THRESHOLD = float(os.getenv("MAX_SPREAD_THRESHOLD", "0.10"))  # Hard cap: reject if spread > 10%
+MIN_EDGE_FLOOR = 0.20           # Absolute hard floor: never trade below 20% edge
+BANNED_THEMES = frozenset({"geopolitics", "politics", "macro"})  # No LLM edge — market aggregates all public info
+MAX_POSITIONS_PER_THEME = 1     # Correlation cap: prevent thematic clustering across positions
 
 # === Market Category Filters ===
 # Markets whose questions match any keyword (case-insensitive) are skipped
@@ -90,6 +96,29 @@ SKIP_MARKET_KEYWORDS = [
     "opening weekend box office",
     "number one at the box office",
 ]
+
+# === Market Discovery — Tier Resolution Boundaries ===
+# Single source of truth for tier day-limits. Used in both discovery and risk evaluation.
+SHORT_TERM_MAX_DAYS  = 14   # Tier 1: ≤14 days (weekly data, near-term events)
+MEDIUM_TERM_MAX_DAYS = 60   # Tier 2: 15–60 days (monthly events, near-term macro)
+# Tier 3: >60 days (long-horizon, slowest calibration feedback)
+
+# === Market Discovery — Per-Tier Thresholds ===
+# Short-term markets have less time to accumulate volume, so lower floors are needed.
+SHORT_TERM_MIN_VOLUME     = 300    # markets resolving ≤14 days
+SHORT_TERM_MIN_LIQUIDITY  = 150
+MEDIUM_TERM_MIN_VOLUME    = 500    # markets resolving 15-60 days
+MEDIUM_TERM_MIN_LIQUIDITY = 250
+LONG_TERM_MIN_VOLUME      = 1000   # markets resolving >60 days (previous values)
+LONG_TERM_MIN_LIQUIDITY   = 500
+MIN_DAYS_TO_RESOLUTION    = 2      # Skip markets resolving within 48h (illiquid near expiry)
+
+# Per-tier intra-cycle exposure caps.
+# Prevents same-cycle overloading of short-term or medium-term positions.
+SHORT_TERM_MAX_CYCLE_EXPOSURE_PCT  = 0.20  # Max 20% bankroll in new short-term entries per cycle
+MEDIUM_TERM_MAX_CYCLE_EXPOSURE_PCT = 0.40  # Max 40% bankroll in new medium-term entries per cycle
+# Long-term: governed by existing MAX_TOTAL_EXPOSURE_PCT = 0.60
+
 
 # === Exit Thresholds ===
 

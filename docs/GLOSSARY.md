@@ -32,6 +32,10 @@
 | **Edge** | The difference between your estimated probability and the market price. If you think YES is 70% likely but it trades at $0.55, your edge is 15%. | The bot only trades when edge > 10%. No edge = no trade. |
 | **Liquidity** | How much money is available in a market's order book. High liquidity = easy to buy/sell without moving the price. | The bot filters out low-liquidity markets to avoid slippage. |
 | **Slippage** | The difference between the expected price and the actual fill price. Happens in low-liquidity markets. | Large orders in thin markets get worse prices. The bot uses limit orders to control this. |
+| **Partial Fill** | When a limit order fills only part of the requested quantity. The rest stays in the book as an open GTC order. | A 30-share GTC order may only fill 2 shares immediately if only 2 are available at that price. The agent tracks both the filled shares and the remaining open order. |
+| **Adverse Selection** | Consistently trading against counterparties who have better information than you. Crossing the spread means you always buy from someone willing to sell at a price you wouldn't otherwise reach — because they think the true value is higher. | Reason we don't automatically raise bids when GTC orders don't fill — we'd systematically overpay to trade against more informed participants. |
+| **Crossing the Spread** | Placing an order at the ask (for buys) or bid (for sells) price to guarantee immediate execution, instead of posting at the midpoint and waiting. | Guarantees a fill but costs more and exposes you to adverse selection. Only rational when edge is large enough to absorb the extra cost and you are confident in your estimate. |
+| **Liquidity Illusion** | Believing a market is more liquid than it actually is based on aggregate volume figures, without checking whether your specific order size can actually be filled at your price. | A market with $1,000 total volume may have only $50 available at the current midpoint. The execution eligibility gate (book depth check) addresses this. |
 
 ## Trading Concepts
 
@@ -61,6 +65,14 @@
 | **Position Sizing** | Deciding how much capital to allocate to each trade. Too much = one bad trade wipes you out. Too little = gains are meaningless. | The risk manager enforces max 5% of bankroll per market. |
 | **Exposure** | Total capital at risk across all open positions. | Capped at 50% of bankroll — the other 50% stays as cash reserve. |
 | **Kill Switch** | An emergency mechanism to halt all trading immediately. | Create a `data/STOP` file and the bot stops at the next cycle. |
+| **Execution Eligibility Gate** | A set of pre-trade conditions that must all pass before an order is sent to the market. Goes beyond edge — checks whether the market can actually absorb the order cleanly. | Our gate: (1) edge > minimum, (2) spread ≤ 10%, (3–5) pool concentration, slippage, and book depth — conditions 3–5 are shadow-logged only until thresholds are calibrated. |
+| **Shadow Mode** | Running a check and logging a warning when it would have fired, but not actually blocking the trade. Used to observe how often a new rule fires before deciding whether to enforce it. | Conditions 3–5 of the execution gate run in shadow mode. Grep `SHADOW gate` in logs to review data before tightening. Prevents over-filtering without evidence. |
+| **Fair Value Exit (Option B)** | A take profit strategy that exits when the current token price has converged 90% of the way from entry to estimated fair value, where fair value is derived from the probability estimate at trade time (YES: `estimated_prob`; NO: `1 - estimated_prob`). | Replaces the old "75% of distance to $1" formula, which required cheap tokens (e.g., 4.5¢ entry) to reach absurdly high prices before triggering. Fair value exit scales rationally with the actual edge, not the absolute distance to $1. |
+| **Probability-Anchored** | A rule or threshold that is tied to a probability estimate rather than a raw price level. | Our take profit formula is probability-anchored: a 4.5¢ NO token with 85% fair value (15% estimated prob YES) exits at ~77¢ — matching the edge we identified. A price-anchored rule exits at a fixed multiple of entry regardless of what we actually believe about fair value. |
+| **Edge Floor** | An absolute minimum edge requirement enforced regardless of other dynamic factors (spread, regime, resolution clarity). | `MIN_EDGE_FLOOR = 0.20` (20%). Even a $0.01 spread liquid market won't be traded unless edge ≥ 20%. Prevents low-conviction trades that look cheap but lose money when the thesis is wrong. |
+| **Theme Ban** | A list of market categories where an LLM has no informational edge and is therefore prohibited from trading. | `BANNED_THEMES = {geopolitics, politics, macro}`. These domains aggregate all public information efficiently — professional traders read the same news. Running Iran NO positions while geopolitical news breaks is competing against better-informed capital. |
+| **Correlation Cap** | A limit on the number of open positions in the same market theme to prevent hidden leverage from thematic clustering. | `MAX_POSITIONS_PER_THEME = 1`. If one crypto position is open, no second crypto position can open until the first closes. Prevents the Iran scenario where 3 correlated NO positions all lost when one geopolitical event resolved. |
+| **Thematic Clustering** | Holding multiple positions in the same market theme, creating concentrated risk that looks diversified on paper. | Three Iran NO positions (one "Iran strikes Israel by Feb", one "Iran nuclear deal by March", one "Iran military activity") are a single bet on Iran not doing anything. One event hits all three. |
 
 ## Machine Learning & NLP
 
@@ -173,6 +185,22 @@
 | **Crash Recovery** | The ability to restart after an unexpected termination and resume from a known-good state. | Without recovery, a crash means the bot forgets all open positions — risking duplicate orders and exposure limit violations. |
 | **Response Size Limit** | Capping the maximum bytes accepted from an API response to prevent memory exhaustion (a form of DoS). | Gamma API responses are limited to 5MB and 200 markets. A compromised or misconfigured API can't crash the bot by sending gigabytes of data. |
 | **Exception Narrowing** | Replacing broad `except Exception` with specific types (`HTTPStatusError`, `ConnectionError`, etc.) so only expected errors are caught. | Broad catches mask bugs — a `TypeError` from bad code gets silently swallowed instead of raising. Narrow catches let real bugs surface. |
+
+---
+
+---
+
+## Market Discovery (from Session 22)
+
+| Term | Definition | Why It Matters Here |
+|------|-----------|---------------------|
+| **Tiered Discovery** | Making separate API calls filtered by resolution date range so each tier (short/medium/long) has its own liquidity-ranked pool. | A single top-100 liquidity call always returns large long-horizon markets. Short-term markets need their own pool. |
+| **end_date_min / end_date_max** | Gamma API query params that filter markets by resolution date range (ISO8601 strings). | Used to scope each API call to one tier: `end_date_max=today+14d` for short-tier, `end_date_min=today+61d` for long-tier. |
+| **Near-Expiry Skip** | Dropping markets resolving within the next 48 hours from consideration. | In the last 48h, market makers widen spreads and prices become erratic as uncertainty concentrates. Edge calculations become unreliable. |
+| **Tier-Appropriate Thresholds** | Using different volume/liquidity floors per resolution tier. | Short-term markets haven't had months to accumulate volume. A weekly economic report market at $400 volume is liquid enough; rejecting it at the $1000 long-term floor would be wrong. |
+| **Per-Tier Intra-Cycle Cap** | Capping how much of the bankroll can be committed to new short-term or medium-term entries within a single cycle. | Without tier caps, a cycle that finds 5 short-term markets could allocate 50% of bankroll to them, creating concentrated near-term expiry risk. |
+| **Calibration Feedback** | Observing actual market outcomes to verify whether the agent's probability estimates are accurate over time. | A well-calibrated agent that predicts 70% on average should win about 70% of those trades. Only resolutions give feedback — long-only positions give none for months. |
+| **Cross-Pool Deduplication** | Removing a market that appears in multiple tier pools so it's only counted once. | The short-tier `end_date_max` and medium-tier `end_date_min` share the boundary day; the same market could theoretically appear in both responses. |
 
 ---
 
