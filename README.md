@@ -14,10 +14,10 @@ discover_markets → research_markets → generate_signals → evaluate_risks �
 
 1. **Discover** — Makes three targeted Gamma API calls (one per resolution tier) to find short-, medium-, and long-term markets. Prioritises short-term markets for fast calibration feedback.
 2. **Research** — Collects news from NewsAPI, RSS feeds, Stocktwits, Google Trends, CoinGecko, Metaculus, Fear & Greed, FRED, and Finnhub for each candidate market.
-3. **Analyze** — FinBERT scores article sentiment; Claude estimates event probabilities independently (without seeing the market price, to avoid anchoring bias).
+3. **Analyze** — FinBERT scores article sentiment; Claude estimates event probabilities using a two-phase design: Phase 1 produces an independent estimate from evidence only (market price hidden to prevent anchoring); Phase 2 reveals the market price for a calibration check — Claude can adjust if it identifies a genuine blind spot, but cannot blindly converge.
 4. **Risk Check** — Fractional Kelly criterion sizes positions; hard limits enforced including per-theme correlation caps and per-tier cycle exposure caps.
 5. **Execute** — Places paper trades (or real orders via CLOB API in live mode). GTC order fills are reconciled each cycle.
-6. **Monitor** — Tracks open positions, checks stop-loss/take-profit exits, runs GTC reconciliation, verifies resolutions against Gamma API.
+6. **Monitor** — Tracks open positions, checks stop-loss/take-profit exits, runs GTC reconciliation, verifies resolutions against Gamma API. A background price scanner runs every 60 seconds between cycles to catch fast-moving exits.
 
 Orchestrated by [LangGraph](https://github.com/langchain-ai/langgraph) as a state machine.
 
@@ -100,7 +100,7 @@ agent_trader/
 │   └── utils/
 │       ├── logger.py              #   Structured logging + secret redaction
 │       └── db.py                  #   SQLite persistence
-├── tests/                         # 177 tests (unit + integration + security)
+├── tests/                         # 198 tests (unit + integration + security)
 ├── docs/                          # Learning documentation
 │   ├── PROGRESS.md                #   Session-by-session progress log
 │   ├── BUGS.md                    #   Every bug with root cause + lesson
@@ -158,7 +158,7 @@ See [SECURITY.md](SECURITY.md) for the full threat model and emergency procedure
 ## Testing
 
 ```bash
-# Run all 177 tests
+# Run all 198 tests
 pytest tests/ -v
 
 # Run only security tests
@@ -184,7 +184,7 @@ pytest tests/test_market_discovery.py -v
 This project prioritises learning. Every session, bug, and decision is documented:
 
 - **[docs/PROGRESS.md](docs/PROGRESS.md)** — What was built each session, decisions made, what's next
-- **[docs/BUGS.md](docs/BUGS.md)** — 26+ bugs tracked with root causes and lessons learned
+- **[docs/BUGS.md](docs/BUGS.md)** — 30+ bugs tracked with root causes and lessons learned
 - **[docs/GLOSSARY.md](docs/GLOSSARY.md)** — 100+ terms across blockchain, trading, ML, and security
 - **[SECURITY.md](SECURITY.md)** — Threat model, credentials, emergency procedures
 
