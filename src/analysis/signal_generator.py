@@ -113,6 +113,7 @@ class TradingSignal:
     resolution_clarity_score: int = 1           # 1 (vague) → 5 (precise), drives clarity_penalty
     market_theme: str = "other"                 # crypto/macro/geopolitics/tech/politics/other
     spread: float = 0.05                        # Estimated bid-ask spread (used as cost floor)
+    liquidity: float = 0.0                      # Total pool liquidity in USD (from Gamma API)
 
 
 class SignalGenerator:
@@ -159,6 +160,10 @@ class SignalGenerator:
         current_price = self._get_market_price(market)
         spread = _estimate_spread(market)
         yes_token_id, no_token_id = self._get_token_ids(market)
+        try:
+            liquidity = float(market.get("liquidity", 0) or 0)
+        except (ValueError, TypeError):
+            liquidity = 0.0
         deadline = market.get("end_date_iso", market.get("end_date", "Unknown"))
         resolution_source = market.get("resolutionSource", "")
         market_description = market.get("description", "")
@@ -246,6 +251,7 @@ class SignalGenerator:
             resolution_clarity_score=resolution_clarity_score,
             market_theme=market_theme,
             spread=spread,
+            liquidity=liquidity,
         )
 
         logger.info(

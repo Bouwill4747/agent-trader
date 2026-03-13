@@ -8,10 +8,15 @@ from dataclasses import dataclass
 from config.settings import (
     KELLY_FRACTION,
     MAX_POSITION_PCT,
+    MAX_MARKET_EXPOSURE_PCT,
     MAX_TOTAL_EXPOSURE_PCT,
     MAX_CONCURRENT_POSITIONS,
     MAX_DRAWDOWN_PCT,
+    DRAWDOWN_RISK_REDUCING_PCT,
     MIN_TRADE_SIZE,
+    MAX_SPREAD_THRESHOLD,
+    MIN_EDGE_FLOOR,
+    BANNED_THEMES,
 )
 from src.utils.logger import setup_logger
 
@@ -56,6 +61,9 @@ class RiskManager:
         resolution_type: str = "subjective_event",
         resolution_clarity_score: int = 1,
         spread: float = 0.05,
+        market_exposure: float = 0.0,
+        liquidity: float = 0.0,
+        market_theme: str = "",
     ) -> RiskDecision:
         """Decide whether to take a trade and how much to risk.
 
@@ -72,7 +80,11 @@ class RiskManager:
             resolution_clarity_score: 1 (vague) to 5 (precise) — adds clarity penalty
                 clarity_penalty = (5 - score) × 1%
             spread: Estimated bid-ask spread (fraction). Sets the cost floor:
-                cost_floor = spread × 1.5  (spread + half-spread for slippage)
+                cost_floor = spread × 1.5  (spread + half-spread for slippage).
+                Hard rejected if spread > MAX_SPREAD_THRESHOLD (10%).
+            liquidity: Total pool liquidity in USD (from Gamma API).
+                Used for shadow gate logging — conditions 3–5 are observed
+                but not yet enforced. Search logs for "SHADOW" to review.
 
         Returns:
             RiskDecision with approved/rejected, position size, and reason
@@ -90,6 +102,15 @@ class RiskManager:
             return RiskDecision(
                 approved=False, position_size=0, shares=0,
                 reason=f"Max positions reached: {num_positions}/{MAX_CONCURRENT_POSITIONS}"
+            )
+
+        # ── Check 2b: Banned theme filter ──
+        # Markets in these domains aggregate all public information efficiently.
+        # An LLM has no informational edge vs professional traders who also read the news.
+        if market_theme and market_theme in BANNED_THEMES:
+            return RiskDecision(
+                approved=False, position_size=0, shares=0,
+                reason=f"Banned theme: '{market_theme}' — no LLM edge in this domain"
             )
 
         # ── Check 3: Calculate edge (direction-aware) ──
@@ -160,7 +181,12 @@ class RiskManager:
         # cost_floor = spread × 1.5  (spread to cross the book + ~half-spread for slippage)
         cost_floor = spread * 1.5
 
-        effective_min_edge = cost_floor + regime_edge_bonus + resolution_buffer + clarity_penalty
+        dynamic_min_edge = cost_floor + regime_edge_bonus + resolution_buffer + clarity_penalty
+
+        # Hard floor: never trade below 20% edge regardless of spread/regime/resolution.
+        # Even cheap liquid markets can lose money when the thesis is wrong — the floor
+        # enforces that only high-conviction signals reach execution.
+        effective_min_edge = max(MIN_EDGE_FLOOR, dynamic_min_edge)
 
         if edge < effective_min_edge:
             details = [f"spread_cost={cost_floor:.0%}"]
@@ -170,11 +196,25 @@ class RiskManager:
                 details.append(f"resolution={resolution_type} +{resolution_buffer:.0%}")
             if clarity_penalty > 0:
                 details.append(f"clarity={_score}/5 +{clarity_penalty:.0%}")
+            if MIN_EDGE_FLOOR > dynamic_min_edge:
+                details.append(f"floor={MIN_EDGE_FLOOR:.0%}")
             reason = (
                 f"Edge too small: {edge:.1%} < {effective_min_edge:.1%}"
                 f" ({', '.join(details)})"
             )
             return RiskDecision(approved=False, position_size=0, shares=0, reason=reason)
+
+        # ── Check 3c: Spread hard cap (condition 2 of execution eligibility gate) ──
+        #
+        # Even with sufficient edge, a spread above 10% means execution quality
+        # is too poor — the cost_floor alone won't protect us from a wide bid-ask.
+        # This is a separate, explicit gate rather than relying on cost_floor to
+        # implicitly reject via the edge check.
+        if spread > MAX_SPREAD_THRESHOLD:
+            return RiskDecision(
+                approved=False, position_size=0, shares=0,
+                reason=f"Spread too wide: {spread:.0%} > {MAX_SPREAD_THRESHOLD:.0%} — execution quality too poor"
+            )
 
         # ── Check 4: Low confidence filter ──
         if confidence == "low":
@@ -241,6 +281,18 @@ class RiskManager:
         if position_size > remaining_exposure:
             position_size = remaining_exposure
 
+        # Per-market concentration cap — prevents piling into one market
+        if bankroll > 0:
+            market_exposure_pct = market_exposure / bankroll
+            if market_exposure_pct >= MAX_MARKET_EXPOSURE_PCT:
+                return RiskDecision(
+                    approved=False, position_size=0, shares=0,
+                    reason=f"Per-market cap reached: {market_exposure_pct:.1%} >= {MAX_MARKET_EXPOSURE_PCT:.1%} in this market"
+                )
+            remaining_market = (MAX_MARKET_EXPOSURE_PCT - market_exposure_pct) * bankroll
+            if position_size > remaining_market:
+                position_size = remaining_market
+
         # Minimum trade size
         if position_size < MIN_TRADE_SIZE:
             return RiskDecision(
@@ -250,6 +302,51 @@ class RiskManager:
 
         # Calculate shares (use effective_price — YES price for BUY_YES, NO price for BUY_NO)
         shares = position_size / effective_price
+
+        # Polymarket CLOB minimum: 5 shares per order
+        if shares < 5:
+            return RiskDecision(
+                approved=False, position_size=0, shares=0,
+                reason=f"Too few shares: {shares:.2f} < 5 (CLOB minimum) — increase position size or raise price"
+            )
+
+        # ── Shadow gate: Execution eligibility conditions 3–5 (logging only) ──
+        #
+        # These conditions are NOT yet enforced. They log warnings so we can
+        # observe how often they would fire before setting thresholds.
+        # Search logs for "SHADOW gate" to review before tightening.
+        #
+        # Condition 3: position size <= 3% of pool liquidity
+        #   Prevents consuming a large share of the pool (market impact)
+        # Condition 4: estimated slippage <= 2%
+        #   Simple model: slippage ≈ position_size / liquidity
+        # Condition 5: estimated book depth >= position size
+        #   Proxy: 10% of pool liquidity available at any given price level
+        #   (Replace with live order book data when ready to enforce)
+        if liquidity > 0:
+            pct_of_pool = position_size / liquidity
+            if pct_of_pool > 0.03:
+                logger.warning(
+                    "SHADOW gate 3 (pool concentration): $%.2f = %.1f%% of $%.0f pool"
+                    " (threshold: 3%%)",
+                    position_size, pct_of_pool * 100, liquidity,
+                )
+
+            estimated_slippage = position_size / liquidity
+            if estimated_slippage > 0.02:
+                logger.warning(
+                    "SHADOW gate 4 (slippage): ~%.1f%% estimated on $%.0f pool"
+                    " (threshold: 2%%)",
+                    estimated_slippage * 100, liquidity,
+                )
+
+            depth_proxy = liquidity * 0.10  # assume 10% of liquidity sits at any price level
+            if depth_proxy < position_size:
+                logger.warning(
+                    "SHADOW gate 5 (book depth): proxy $%.2f < position $%.2f"
+                    " on $%.0f pool (threshold: depth >= position, proxy=10%% of liquidity)",
+                    depth_proxy, position_size, liquidity,
+                )
 
         logger.info(
             "APPROVED: $%.2f (%.0f shares) — Edge: %.1f%%, Kelly: %.1f%% → %.1f%%, Confidence: %s",
@@ -265,6 +362,21 @@ class RiskManager:
             kelly_raw=kelly_raw,
             kelly_sized=kelly_sized,
         )
+
+    def get_trading_mode(self, current_drawdown: float) -> str:
+        """Return the current trading mode based on drawdown level.
+
+        Modes (ordered by severity):
+          NORMAL            — drawdown below DRAWDOWN_RISK_REDUCING_PCT
+          RISK_REDUCING_ONLY — between DRAWDOWN_RISK_REDUCING_PCT and MAX_DRAWDOWN_PCT
+                              (exits/stop-losses run; no new entries)
+          HALTED            — drawdown >= MAX_DRAWDOWN_PCT (full stop)
+        """
+        if current_drawdown >= MAX_DRAWDOWN_PCT:
+            return "HALTED"
+        if current_drawdown >= DRAWDOWN_RISK_REDUCING_PCT:
+            return "RISK_REDUCING_ONLY"
+        return "NORMAL"
 
     def check_kill_switch(self) -> bool:
         """Check if the emergency kill switch file exists."""

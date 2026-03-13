@@ -87,6 +87,16 @@ SKIP_MARKET_KEYWORDS = [
     # --- Match-specific language ---
     "match winner", "set winner", "game winner",
     "beat ", "defeat ",  # "Will X beat Y" / "Will X defeat Y"
+    " vs ", " vs. ",     # Direct player/team matchups ("Celtics vs. Spurs", "Diallo vs Bellucci")
+    "set handicap",      # Tennis point-spread betting format
+
+    # --- Sports championship / tournament language ---
+    "championship",      # "Will X win the MVC conference championship?" — catches leagues/cups broadly
+    "masters tournament", # Golf Masters (PGA major)
+    "win the cup",       # "Will X win the cup?"
+    "win the league",    # "Will X win the league?"
+    "ko/tko",            # Combat sports outcomes ("Will X win by KO/TKO?")
+    "by submission",     # MMA submission outcomes
 
     # --- Entertainment awards ---
     "best actor", "best actress", "best director", "best picture",
@@ -95,6 +105,10 @@ SKIP_MARKET_KEYWORDS = [
     "emmy", "grammy", "golden globe", "bafta",
     "opening weekend box office",
     "number one at the box office",
+
+    # --- Unanswerable novelty markets ---
+    "tweets in ",        # Elon Musk tweet-count markets (no data source can answer these)
+    "truth social",      # Trump Truth Social post-count markets (same problem)
 ]
 
 # === Market Discovery — Tier Resolution Boundaries ===
@@ -124,6 +138,13 @@ MEDIUM_TERM_MAX_CYCLE_EXPOSURE_PCT = 0.40  # Max 40% bankroll in new medium-term
 
 EXIT_STOP_LOSS_PCT = -0.25       # Exit when position is down 25%
 EXIT_RESOLVED_THRESHOLD = 0.95   # Price >= 0.95 or <= 0.05 = market resolved
+
+
+# === Price Scanner Settings ===
+
+PRICE_SCAN_INTERVAL_SECONDS = 60          # Seconds between background price scans
+SCANNER_HARD_LOSS_PCT = 0.50              # Structural collapse: exit if price ≤ avg_price × (1 − 0.50)
+SCANNER_TAKE_PROFIT_CONFIRMATIONS = 2     # Consecutive take-profit signals before scanner exits
 
 
 # === LLM Settings ===

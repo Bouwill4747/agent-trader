@@ -91,6 +91,8 @@ async def init_db():
             ("market_theme",            "TEXT"),     # crypto/macro/geopolitics/tech/politics/other
             ("resolution_type",         "TEXT"),     # mechanical_numeric/price_print/formal_recognition/subjective_event
             ("resolution_clarity_score","INTEGER"),  # 1 (vague) to 5 (precise)
+            ("position_side",           "TEXT"),     # "YES" or "NO" — which side of the market we hold
+            ("market_price_yes",        "REAL"),     # YES token price at signal time (canonical primitive)
         ]
         for col_name, col_type in new_columns:
             try:
@@ -113,8 +115,9 @@ async def insert_trade(trade: dict):
                 (timestamp, market_id, token_id, question, side,
                  price, size, total_cost, order_type, status, paper_trade,
                  claude_reasoning, estimated_prob, confidence, edge,
-                 market_theme, resolution_type, resolution_clarity_score)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 market_theme, resolution_type, resolution_clarity_score,
+                 position_side, market_price_yes)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             trade["timestamp"], trade["market_id"], trade["token_id"],
             trade.get("question", ""), trade["side"],
@@ -125,6 +128,7 @@ async def insert_trade(trade: dict):
             trade.get("confidence"), trade.get("edge"),
             trade.get("market_theme"), trade.get("resolution_type"),
             trade.get("resolution_clarity_score"),
+            trade.get("position_side"), trade.get("market_price_yes"),
         ))
         await db.commit()
 
@@ -154,6 +158,74 @@ async def update_trade_outcome(market_id: str, outcome: int, exit_reason: str):
         await db.commit()
 
 
+async def get_open_filled_trades() -> list[dict]:
+    """Return all non-paper BUY trades that are filled but not yet resolved.
+
+    Used by the portfolio integrity reconciler to detect positions that are
+    in the DB as filled/open but missing from the in-memory portfolio —
+    e.g. accidentally purged (BUG-025) or never added after a restart gap.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT id, market_id, token_id, question, price, size, position_side, estimated_prob
+            FROM trades
+            WHERE side = 'BUY' AND paper_trade = 0
+              AND status = 'filled'
+              AND actual_outcome IS NULL
+            ORDER BY id ASC
+        """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_pending_live_trades() -> list[dict]:
+    """Return all non-paper BUY trades still marked as pending (unfilled GTC orders).
+
+    Used by the GTC reconciliation step to detect orders that filled silently
+    after the cycle that placed them.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT id, market_id, token_id, question, price, size, position_side, estimated_prob,
+                   timestamp
+            FROM trades
+            WHERE side = 'BUY' AND paper_trade = 0 AND status = 'pending'
+            ORDER BY id ASC
+        """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def get_pending_sell_trades() -> list[dict]:
+    """Return all non-paper SELL trades still marked as pending (unfilled GTC exits).
+
+    Used by the SELL reconciliation step to detect exit orders that filled
+    after the cycle that placed them.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT id, market_id, token_id, question, price, size
+            FROM trades
+            WHERE side = 'SELL' AND paper_trade = 0 AND status = 'pending'
+            ORDER BY id ASC
+        """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+async def mark_trade_status(trade_id: int, new_status: str):
+    """Update the status column for a single trade row."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE trades SET status = ? WHERE id = ?",
+            (new_status, trade_id),
+        )
+        await db.commit()
+
+
 async def get_calibration_stats() -> list:
     """Return win-rate vs estimated-probability grouped by confidence level.
 
@@ -180,6 +252,7 @@ async def get_calibration_stats() -> list:
             WHERE side = 'BUY'
               AND actual_outcome IS NOT NULL
               AND confidence IS NOT NULL
+              AND edge > 0
             GROUP BY confidence
             ORDER BY
                 CASE confidence
@@ -191,6 +264,55 @@ async def get_calibration_stats() -> list:
         """)
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+
+async def get_trade_summary() -> dict:
+    """Overall closed-trade stats for the calibration report.
+
+    Returns a single dict with aggregate metrics across all resolved live trades:
+    total, wins, win_rate, avg estimated_prob for wins vs losses, avg edge for
+    wins vs losses, and exit reason breakdown.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT
+                COUNT(*)                                                     AS total,
+                SUM(actual_outcome)                                          AS wins,
+                ROUND(AVG(actual_outcome), 3)                                AS win_rate,
+                ROUND(AVG(CASE WHEN actual_outcome=1 THEN estimated_prob END), 3) AS avg_prob_wins,
+                ROUND(AVG(CASE WHEN actual_outcome=0 THEN estimated_prob END), 3) AS avg_prob_losses,
+                ROUND(AVG(CASE WHEN actual_outcome=1 THEN edge END), 3)      AS avg_edge_wins,
+                ROUND(AVG(CASE WHEN actual_outcome=0 THEN edge END), 3)      AS avg_edge_losses,
+                SUM(CASE WHEN exit_reason='STOP_LOSS'       THEN 1 ELSE 0 END) AS stop_losses,
+                SUM(CASE WHEN exit_reason='TAKE_PROFIT'     THEN 1 ELSE 0 END) AS take_profits,
+                SUM(CASE WHEN exit_reason LIKE 'RESOLVED%'  THEN 1 ELSE 0 END) AS resolved
+            FROM trades
+            WHERE side = 'BUY'
+              AND actual_outcome IS NOT NULL
+              AND paper_trade = 0
+              AND edge > 0
+        """)
+        row = await cursor.fetchone()
+        return dict(row) if row else {}
+
+
+async def get_open_position_themes() -> dict:
+    """Return {market_id: market_theme} for all open BUY positions with a known theme.
+
+    Uses actual_outcome IS NULL as a proxy for 'still open'. Caller should
+    filter by portfolio.positions to ensure only truly-tracked positions count.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT market_id, market_theme
+            FROM trades
+            WHERE side = 'BUY' AND actual_outcome IS NULL AND market_theme IS NOT NULL
+            GROUP BY market_id
+        """)
+        rows = await cursor.fetchall()
+        return {row["market_id"]: row["market_theme"] for row in rows}
 
 
 async def insert_signal(signal: dict):

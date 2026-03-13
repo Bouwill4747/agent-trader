@@ -26,6 +26,7 @@ class OrderResult:
     fill_size: float
     paper_trade: bool
     message: str
+    filled: bool = True  # False for GTC "live" orders still pending in the book
 
 
 class Executor:
@@ -67,6 +68,7 @@ class Executor:
         market_theme: str = "",
         resolution_type: str = "",
         resolution_clarity_score: int = 0,
+        current_price_yes: float = 0.0,
     ) -> OrderResult:
         """Execute a trade based on a risk-approved decision.
 
@@ -102,6 +104,18 @@ class Executor:
 
         # Record in database
         if result.success:
+            position_side = "NO" if direction == "BUY_NO" else "YES"
+            # Direction-aware edge: always positive when we have an edge.
+            # signal.edge = estimated_prob_yes - price_yes (negative for valid BUY_NO).
+            # Storing the raw signal.edge for BUY_NO trades makes all calibration data look
+            # like negative EV. Store the side-consistent edge instead.
+            edge_for_side = edge if direction != "BUY_NO" else -edge
+            # Canonical YES price at signal time — the reference point for all analytics.
+            # For BUY_YES: current_price_yes == execution price.
+            # For BUY_NO: execution price is the NO token price; YES price is 1 - NO price.
+            market_price_yes = current_price_yes if current_price_yes > 0 else (
+                result.fill_price if direction != "BUY_NO" else 1.0 - result.fill_price
+            )
             trade_record = {
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "market_id": market_id,
@@ -112,30 +126,41 @@ class Executor:
                 "size": result.fill_size,
                 "total_cost": result.fill_price * result.fill_size,
                 "order_type": "GTC",
-                "status": "filled" if self.paper_mode else "pending",
+                "status": "filled" if (self.paper_mode or result.filled) else "pending",
                 "paper_trade": 1 if self.paper_mode else 0,
                 "claude_reasoning": reasoning or None,
                 "estimated_prob": estimated_prob or None,
                 "confidence": confidence or None,
-                "edge": edge or None,
+                "edge": edge_for_side or None,
                 "market_theme": market_theme or None,
                 "resolution_type": resolution_type or None,
                 "resolution_clarity_score": resolution_clarity_score or None,
+                "position_side": position_side,
+                "market_price_yes": market_price_yes or None,
             }
             await insert_trade(trade_record)
 
-            # Determine position side from direction (not from "BUY" string)
-            position_side = "NO" if direction == "BUY_NO" else "YES"
-            opened = self.portfolio.open_position(
-                market_id=market_id,
-                token_id=token_id,
-                question=question,
-                side=position_side,
-                shares=result.fill_size,
-                price=result.fill_price,
-            )
-            if not opened:
-                logger.warning("Portfolio rejected position for %s — insufficient cash", market_id)
+            # Only open portfolio position if the order actually filled.
+            # GTC orders with status="live" are resting in the book — we don't
+            # hold the tokens yet, so we must not track them as open positions.
+            if result.filled:
+                position_side = "NO" if direction == "BUY_NO" else "YES"
+                opened = self.portfolio.open_position(
+                    market_id=market_id,
+                    token_id=token_id,
+                    question=question,
+                    side=position_side,
+                    shares=result.fill_size,
+                    price=result.fill_price,
+                    estimated_prob=estimated_prob,
+                )
+                if not opened:
+                    logger.warning("Portfolio rejected position for %s — insufficient cash", market_id)
+            else:
+                logger.info(
+                    "GTC order placed for '%s' — pending fill, position not tracked yet",
+                    question[:40]
+                )
 
         return result
 
@@ -182,14 +207,23 @@ class Executor:
 
         if response:
             order_id = response.get("orderID", response.get("id", "unknown"))
-            logger.info("[LIVE] Order placed: %s", order_id)
+            status = response.get("status", "")
+            # "matched" = filled immediately; "live" = GTC resting in book (tokens NOT yet received)
+            filled = (status == "matched")
+            if not filled:
+                logger.warning(
+                    "[LIVE] GTC order pending (status=%s) — tokens not received yet, not tracking: %s",
+                    status, question[:40]
+                )
+            logger.info("[LIVE] Order placed: %s (status=%s, filled=%s)", order_id, status, filled)
             return OrderResult(
                 success=True,
                 order_id=order_id,
                 fill_price=price,
                 fill_size=shares,
                 paper_trade=False,
-                message=f"Live order placed: {order_id}",
+                message=f"Live order placed: {order_id} (status={status})",
+                filled=filled,
             )
         else:
             logger.error("[LIVE] Order failed for %s", question[:40])
@@ -252,15 +286,19 @@ class Executor:
             }
             await insert_trade(trade_record)
 
-            # Close position in portfolio (restores cash, books PnL)
-            self.portfolio.close_position(market_id, price)
-
-            # Record outcome on the original BUY trade for calibration tracking
-            outcome = 1 if reason == "TAKE_PROFIT" else 0  # STOP_LOSS → 0
-            try:
-                await update_trade_outcome(market_id, outcome=outcome, exit_reason=reason)
-            except Exception as e:
-                logger.warning("Failed to record trade outcome for %s: %s", market_id, e)
+            if self.paper_mode:
+                # Paper mode: assume instant fill — close the position immediately
+                self.portfolio.close_position(market_id, price)
+                outcome = 1 if reason == "TAKE_PROFIT" else 0
+                try:
+                    await update_trade_outcome(market_id, outcome=outcome, exit_reason=reason)
+                except Exception as e:
+                    logger.warning("Failed to record trade outcome for %s: %s", market_id, e)
+            else:
+                # Live mode: GTC SELL order is now resting in the book.
+                # Tokens are still held until the order fills — do NOT close the position yet.
+                # _reconcile_sell_orders() will call close_position() when CLOB balance drops to 0.
+                self.portfolio.mark_selling(market_id, price=result.fill_price, reason=reason)
 
         return result
 
@@ -295,12 +333,22 @@ class Executor:
             shares, price, question[:40], reason
         )
 
-        response = self.client.place_order(
-            token_id=token_id,
-            price=price,
-            size=shares,
-            side="SELL",
-        )
+        try:
+            response = self.client.place_order(
+                token_id=token_id,
+                price=price,
+                size=shares,
+                side="SELL",
+            )
+        except Exception as e:
+            # "not enough balance / allowance" means we don't hold these tokens —
+            # most likely the original BUY was a GTC order that never filled.
+            logger.error("[LIVE] SELL order failed (phantom position?): %s", e)
+            return OrderResult(
+                success=False, order_id="", fill_price=0,
+                fill_size=0, paper_trade=False,
+                message=f"SELL failed: {e}",
+            )
 
         if response:
             order_id = response.get("orderID", response.get("id", "unknown"))

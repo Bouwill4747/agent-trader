@@ -16,6 +16,9 @@ blocking the main async event loop.
 import asyncio
 import json
 import re
+import threading
+import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import TypedDict
 
@@ -32,6 +35,7 @@ from config.settings import (
     LONG_TERM_MIN_VOLUME, LONG_TERM_MIN_LIQUIDITY,
     MIN_DAYS_TO_RESOLUTION,
     SHORT_TERM_MAX_CYCLE_EXPOSURE_PCT, MEDIUM_TERM_MAX_CYCLE_EXPOSURE_PCT,
+    PRICE_SCAN_INTERVAL_SECONDS, SCANNER_HARD_LOSS_PCT, SCANNER_TAKE_PROFIT_CONFIRMATIONS,
 )
 from src.data.polymarket_client import PolymarketClient
 from src.data.news_collector import NewsCollector
@@ -50,8 +54,8 @@ from src.trading.portfolio import Portfolio
 from src.utils.logger import setup_logger
 from src.utils.db import (
     init_db, insert_agent_run, update_agent_run, update_trade_outcome,
-    get_pending_live_trades, get_pending_sell_trades, mark_trade_status,
-    get_calibration_stats, get_trade_summary,
+    get_pending_live_trades, get_pending_sell_trades, get_open_filled_trades,
+    mark_trade_status, get_calibration_stats, get_trade_summary,
     get_open_position_themes,
 )
 
@@ -202,6 +206,10 @@ class Orchestrator:
 
         # Error tracking for escalation (H-09)
         self._consecutive_errors = 0
+
+        # Price scanner state
+        self._scanner_running = False
+        self._take_profit_hits: dict[str, int] = defaultdict(int)
 
         # Build the LangGraph workflow
         self.graph = self._build_graph()
@@ -399,13 +407,8 @@ class Orchestrator:
             logger.error("Stocktwits collection failed: %s", e)
             errors.append(str(e))
 
-        try:
-            trends_articles = self.trends.get_trends_for_markets(markets)
-            for market_id, trend_list in trends_articles.items():
-                articles[market_id] = articles.get(market_id, []) + trend_list
-        except Exception as e:
-            logger.error("Google Trends collection failed: %s", e)
-            errors.append(str(e))
+        # Google Trends disabled — TooManyRequestsError on every call, wastes ~30s/cycle.
+        # Re-enable with a proper rate-limit backoff if needed in future.
 
         try:
             cg_articles = self.coingecko.get_price_context_for_markets(markets)
@@ -415,13 +418,8 @@ class Orchestrator:
             logger.error("CoinGecko collection failed: %s", e)
             errors.append(str(e))
 
-        try:
-            meta_articles = self.metaculus.get_forecasts_for_markets(markets)
-            for market_id, meta_list in meta_articles.items():
-                articles[market_id] = articles.get(market_id, []) + meta_list
-        except Exception as e:
-            logger.error("Metaculus collection failed: %s", e)
-            errors.append(str(e))
+        # Metaculus disabled — returns 403/429 on every call (API access blocked).
+        # Re-enable if credentials are added or access is restored.
 
         try:
             fg_articles = self.fear_greed.get_index_for_markets(markets)
@@ -555,6 +553,11 @@ class Orchestrator:
         """Node 3: Run FinBERT + Claude analysis, produce trading signals."""
         logger.info("── Step 3: Generating signals ──")
 
+        # Sync cash before the drawdown check so we use real wallet balance,
+        # not the stale snapshot value loaded at startup. Without this, the
+        # drawdown appears lower than reality and HALTED mode doesn't trigger.
+        self._sync_cash_from_clob()
+
         # Skip signal generation in RISK_REDUCING_ONLY and HALTED modes.
         # Only _monitor_positions() (exits, stop-losses, reconciliation) should run.
         mode = self.risk.get_trading_mode(self.portfolio.drawdown_pct)
@@ -578,10 +581,14 @@ class Orchestrator:
                 markets, articles, sentiment
             ))
 
-            actionable = [s for s in signals if s.direction != "SKIP"]
+            buy_yes = sum(1 for s in signals if s.direction == "BUY_YES")
+            buy_no  = sum(1 for s in signals if s.direction == "BUY_NO")
+            skipped = sum(1 for s in signals if s.direction == "SKIP")
+            total_directional = buy_yes + buy_no
+            no_ratio = (buy_no / total_directional * 100) if total_directional else 0
             logger.info(
-                "Generated %d signals (%d actionable)",
-                len(signals), len(actionable)
+                "Signals: BUY_YES=%d  BUY_NO=%d  SKIP=%d  (NO_ratio=%.0f%%)",
+                buy_yes, buy_no, skipped, no_ratio,
             )
 
             return {"signals": signals}
@@ -812,16 +819,52 @@ class Orchestrator:
         open_orders = self.client.get_open_orders()
         open_orders_known = open_orders is not None
         open_token_ids: set[str] = set()
+        # token_id → CLOB order_id, for targeted cancellation of stale orders
+        open_order_id_by_token: dict[str, str] = {}
         if open_orders_known:
             for order in open_orders:
                 # py-clob-client returns token_id as 'asset_id'
                 tid = order.get("asset_id") or order.get("token_id", "")
                 if tid:
                     open_token_ids.add(tid)
+                    clob_id = order.get("id") or order.get("order_id", "")
+                    if clob_id:
+                        open_order_id_by_token[tid] = clob_id
+
+        STALE_ORDER_DAYS = 3  # Cancel unfilled GTC buys older than this
 
         for trade in pending:
             market_id = trade["market_id"]
             token_id  = trade["token_id"]
+
+            # Cancel GTC buy orders that have been open longer than STALE_ORDER_DAYS
+            # without filling. Releases locked USDC collateral back to wallet.
+            try:
+                trade_age = (
+                    datetime.now(timezone.utc)
+                    - datetime.fromisoformat(trade["timestamp"])
+                ).days
+            except (TypeError, ValueError):
+                trade_age = 0
+
+            if trade_age >= STALE_ORDER_DAYS and open_orders_known:
+                clob_order_id = open_order_id_by_token.get(token_id)
+                if clob_order_id:
+                    cancelled = self.client.cancel_order(clob_order_id)
+                    if cancelled:
+                        asyncio.run(mark_trade_status(trade["id"], "cancelled"))
+                        logger.info(
+                            "GTC STALE CANCELLED (%d days): '%s'",
+                            trade_age, trade.get("question", "?")[:40],
+                        )
+                        continue
+                elif token_id not in open_token_ids:
+                    # Order already gone from CLOB and no tokens — mark cancelled
+                    asyncio.run(mark_trade_status(trade["id"], "cancelled"))
+                    logger.info(
+                        "GTC STALE (already gone): '%s'", trade.get("question", "?")[:40]
+                    )
+                    continue
 
             # Check actual token balance on CLOB
             balance = self.client.get_token_balance(token_id)
@@ -936,6 +979,131 @@ class Orchestrator:
                 # Position already gone (e.g. resolved) — just mark the SELL trade filled
                 asyncio.run(mark_trade_status(trade["id"], "filled"))
 
+    def _close_orphaned_sells(self) -> None:
+        """Close positions where the sell completed but the portfolio was not updated.
+
+        Handles the edge case where a SELL DB record is already status='filled'
+        (executor confirmed the order) but the portfolio position still has
+        selling_pending=True — caused by a stale snapshot captured mid-close (BUG-028).
+
+        Paper mode: sells complete instantly — any selling_pending is a stale snapshot.
+        Live mode: check CLOB token balance and open orders before closing.
+        """
+        selling = [(mid, pos) for mid, pos in self.portfolio.positions.items()
+                   if pos.selling_pending]
+        if not selling:
+            return
+
+        if self.executor.paper_mode:
+            # Paper sells complete instantly — any selling_pending is a stale snapshot.
+            for market_id, pos in selling:
+                close_price = pos.sell_price or pos.current_price
+                sell_reason = pos.selling_reason or "STOP_LOSS"
+                outcome = 1 if sell_reason == "TAKE_PROFIT" else 0
+                self.portfolio.close_position(market_id, close_price)
+                try:
+                    asyncio.run(update_trade_outcome(
+                        market_id, outcome=outcome, exit_reason=sell_reason
+                    ))
+                except Exception as e:
+                    logger.warning("Failed to record outcome for %s: %s", market_id, e)
+                logger.info(
+                    "ORPHANED SELL CLOSED (paper): '%s' — %.0f shares @ $%.3f (%s)",
+                    pos.question[:40], pos.shares, close_price, sell_reason,
+                )
+            return
+
+        # Live mode: verify tokens are actually gone before closing
+        open_orders = self.client.get_open_orders()
+        open_token_ids: set[str] = set()
+        if open_orders:
+            for order in open_orders:
+                tid = order.get("asset_id") or order.get("token_id", "")
+                if tid:
+                    open_token_ids.add(tid)
+
+        for market_id, pos in selling:
+            balance = self.client.get_token_balance(pos.token_id)
+            if balance is None:
+                continue  # API error — recheck next cycle
+            if balance >= 1:
+                continue  # Tokens still held — sell not yet filled
+            if pos.token_id in open_token_ids:
+                continue  # Open order still live — waiting for fill
+
+            # Tokens gone, no open order → sell completed but portfolio not updated
+            close_price = pos.sell_price or pos.current_price
+            sell_reason = pos.selling_reason or "STOP_LOSS"
+            outcome = 1 if sell_reason == "TAKE_PROFIT" else 0
+            self.portfolio.close_position(market_id, close_price)
+            try:
+                asyncio.run(update_trade_outcome(
+                    market_id, outcome=outcome, exit_reason=sell_reason
+                ))
+            except Exception as e:
+                logger.warning("Failed to record outcome for %s: %s", market_id, e)
+            logger.info(
+                "ORPHANED SELL CLOSED: '%s' — %.0f shares @ $%.3f (%s)",
+                pos.question[:40], pos.shares, close_price, sell_reason,
+            )
+
+    def _reconcile_missing_positions(self) -> None:
+        """Restore filled BUY trades that are missing from the portfolio.
+
+        Compares all filled, unresolved BUY trades in the DB against
+        portfolio.positions. Any trade that's filled/open in the DB but
+        absent from the portfolio may have been accidentally purged (BUG-025)
+        or never added after a restart. Verifies CLOB balance before restoring.
+        """
+        if self.executor.paper_mode:
+            return
+
+        filled_trades = asyncio.run(get_open_filled_trades())
+        if not filled_trades:
+            return
+
+        for trade in filled_trades:
+            market_id = str(trade["market_id"])
+            if market_id in self.portfolio.positions:
+                continue  # Already tracked — nothing to do
+
+            token_id = trade.get("token_id", "")
+            balance = self.client.get_token_balance(token_id)
+            if balance is None or balance < 1:
+                continue  # API error or genuinely empty — don't restore phantom
+
+            # Verify the market is still live by fetching its current midpoint.
+            # A 404 / None return means the orderbook is gone (market resolved or
+            # delisted) — don't restore a zombie position.
+            midpoint = self.client.get_midpoint(token_id)
+            if midpoint is None:
+                logger.debug(
+                    "Skipping restore for '%s' — no orderbook (market likely closed)",
+                    trade.get("question", "?")[:45],
+                )
+                continue
+
+            position_side = trade.get("position_side") or (
+                "NO" if trade["price"] < 0.50 else "YES"
+            )
+            restored = self.portfolio.restore_position(
+                market_id=market_id,
+                token_id=token_id,
+                question=trade.get("question", ""),
+                side=position_side,
+                shares=balance,
+                price=trade["price"],
+                estimated_prob=trade.get("estimated_prob") or 0.0,
+            )
+            if restored:
+                # Set current_price immediately so _check_exit doesn't see None
+                self.portfolio.positions[market_id].current_price = midpoint
+                logger.info(
+                    "MISSING POSITION RESTORED: '%s' — %.2f %s shares @ $%.3f (now $%.3f)",
+                    trade.get("question", "?")[:45], balance, position_side,
+                    trade["price"], midpoint,
+                )
+
     def _monitor_positions(self, state: AgentState) -> dict:
         """Node 6: Check existing positions, auto-exit when thresholds hit."""
         logger.info("── Step 6: Monitoring positions ──")
@@ -944,6 +1112,10 @@ class Orchestrator:
         self._reconcile_gtc_orders()
         # Confirm GTC SELL fills and close positions when tokens are gone
         self._reconcile_sell_orders()
+        # Close positions where sell completed on-chain but portfolio wasn't updated
+        self._close_orphaned_sells()
+        # Restore filled trades that are missing from the portfolio (BUG-031)
+        self._reconcile_missing_positions()
 
         # Update prices for all open positions
         prices = {}
@@ -985,7 +1157,13 @@ class Orchestrator:
                         pos.question[:40], pos.current_price,
                     )
                     continue
-                # Confirmed closed — market has settled
+                # Confirmed closed — atomically claim before resolving so the
+                # scanner cannot simultaneously exit the same position
+                with self.portfolio._lock:
+                    current = self.portfolio.positions.get(market_id)
+                    if current is None or current.selling_pending:
+                        continue
+                    current.selling_pending = True
                 won = pos.current_price >= EXIT_RESOLVED_THRESHOLD
                 logger.info(
                     "EXIT [%s]: '%s' — side=%s, price=$%.3f, won=%s",
@@ -999,7 +1177,13 @@ class Orchestrator:
                 except Exception as e:
                     logger.warning("Failed to record resolved outcome for %s: %s", market_id, e)
             else:
-                # Stop loss or take profit — sell shares at market price
+                # Stop loss or take profit — atomically claim before selling so
+                # the scanner cannot simultaneously exit the same position
+                with self.portfolio._lock:
+                    current = self.portfolio.positions.get(market_id)
+                    if current is None or current.selling_pending:
+                        continue
+                    current.selling_pending = True
                 try:
                     result = asyncio.run(self.executor.execute_exit(
                         market_id=market_id,
@@ -1017,13 +1201,14 @@ class Orchestrator:
                     logger.error("EXIT error for '%s': %s", pos.question[:40], e)
                     self._purge_if_balance_zero(market_id, pos)
 
-            # Save snapshot after each exit
-            asyncio.run(self.portfolio.save_snapshot())
-
         # Sync cash from CLOB so the tracker never drifts from the real wallet.
         # Covers the gap between detecting a resolved win (price-based) and
         # Polymarket actually completing the on-chain USDC redemption.
         self._sync_cash_from_clob()
+
+        # Save snapshot every cycle (not just on exits) so restarts always
+        # load fresh state. Runs after cash sync so saved cash is accurate.
+        asyncio.run(self.portfolio.save_snapshot())
 
         # Log portfolio summary
         logger.info("\n%s", self.portfolio.summary())
@@ -1178,6 +1363,9 @@ class Orchestrator:
         Returns:
             Exit reason string, or None to hold.
         """
+        if current_price is None:
+            return None  # Price unavailable (dead market / API error) — hold
+
         # --- Resolved market detection ---
         # current_price is the price of the token we HOLD (YES price for YES
         # positions, NO price for NO positions). Near $1 = our token wins;
@@ -1319,6 +1507,9 @@ class Orchestrator:
         else:
             logger.info("No previous portfolio found — starting fresh")
 
+        # Start background price scanner (after portfolio is ready)
+        self._start_price_scanner()
+
         while True:
             # Check kill switch before each cycle
             if self.risk.check_kill_switch():
@@ -1335,6 +1526,123 @@ class Orchestrator:
 
             logger.info("Next cycle in %d seconds...", CYCLE_INTERVAL_SECONDS)
             await asyncio.sleep(CYCLE_INTERVAL_SECONDS)
+
+    # ──────────────────────────────────────────────
+    # Background price scanner
+    # ──────────────────────────────────────────────
+
+    def _start_price_scanner(self) -> None:
+        """Start a background daemon thread that polls position prices every minute.
+
+        The scanner captures sharp price moves between hourly cycles — e.g. a
+        market spiking to $0.97 after a news event.  It handles three fast exits:
+          Tier 1a — RESOLVED_SCANNER : price ≥ 0.95 or ≤ 0.05     → immediate
+          Tier 1b — STRUCTURAL_COLLAPSE: price ≤ avg × (1 − 50%)   → immediate
+          Tier 1c — TAKE_PROFIT       : 2 consecutive scans confirm → exit
+
+        Stop-loss exits (-25%) are left to the hourly cycle which runs the full
+        context check (Gamma verification, portfolio snapshot, calibration log).
+        """
+        if self._scanner_running:
+            return
+        self._scanner_running = True
+        t = threading.Thread(target=self._price_scan_loop, daemon=True, name="price-scanner")
+        t.start()
+        logger.info("Price scanner started (interval: %ds)", PRICE_SCAN_INTERVAL_SECONDS)
+
+    def _price_scan_loop(self) -> None:
+        """Background loop: sleep → scan → repeat until process exits."""
+        while True:
+            time.sleep(PRICE_SCAN_INTERVAL_SECONDS)
+            try:
+                self._run_price_scan()
+            except Exception as e:
+                logger.warning("Price scan error: %s", e)
+
+    def _run_price_scan(self) -> None:
+        """Fetch midpoint prices for open positions and evaluate exit conditions."""
+        # Snapshot market IDs under lock — avoids iterating a live dict
+        with self.portfolio._lock:
+            market_ids = list(self.portfolio.positions.keys())
+
+        for market_id in market_ids:
+            # Re-check under lock each iteration — position may have closed
+            with self.portfolio._lock:
+                pos = self.portfolio.positions.get(market_id)
+            if pos is None or pos.selling_pending:
+                continue
+
+            midpoint = self.client.get_midpoint(pos.token_id)
+            if midpoint is None:
+                continue
+
+            # CPython GIL makes float attribute writes safe across threads
+            pos.current_price = midpoint
+            self._scanner_exit_check(market_id, pos, midpoint)
+
+    def _scanner_exit_check(self, market_id: str, pos, current_price: float) -> None:
+        """Evaluate tiered exit conditions for one position.
+
+        Tiers (in priority order):
+          1a RESOLVED_SCANNER   — price ≥ 0.95 or ≤ 0.05        → immediate
+          1b STRUCTURAL_COLLAPSE — price ≤ avg_price × 50%       → immediate
+          1c TAKE_PROFIT         — _check_exit confirms TP twice  → exit
+          (STOP_LOSS is ignored here — handled by the hourly cycle)
+        """
+        # Tier 1a: market effectively resolved
+        if (current_price >= EXIT_RESOLVED_THRESHOLD or
+                current_price <= (1 - EXIT_RESOLVED_THRESHOLD)):
+            self._scanner_trigger_exit(market_id, pos, current_price, "RESOLVED_SCANNER")
+            return
+
+        # Tier 1b: structural collapse — sharp adverse move
+        if pos.avg_price > 0 and current_price <= pos.avg_price * (1 - SCANNER_HARD_LOSS_PCT):
+            self._scanner_trigger_exit(market_id, pos, current_price, "STRUCTURAL_COLLAPSE")
+            return
+
+        # Tier 1c: take-profit confirmed on two consecutive scans
+        exit_signal = self._check_exit(pos, current_price)
+        if exit_signal == "TAKE_PROFIT":
+            self._take_profit_hits[market_id] += 1
+            if self._take_profit_hits[market_id] >= SCANNER_TAKE_PROFIT_CONFIRMATIONS:
+                self._take_profit_hits.pop(market_id, None)
+                self._scanner_trigger_exit(market_id, pos, current_price, "TAKE_PROFIT")
+        else:
+            # Price moved away from take-profit level — reset confirmation counter
+            self._take_profit_hits.pop(market_id, None)
+
+    def _scanner_trigger_exit(self, market_id: str, pos, current_price: float, reason: str) -> None:
+        """Atomically claim and execute an exit from the scanner thread.
+
+        Sets selling_pending under the portfolio lock before calling execute_exit
+        so the hourly cycle cannot simultaneously close the same position.
+        """
+        with self.portfolio._lock:
+            current = self.portfolio.positions.get(market_id)
+            if current is None or current.selling_pending:
+                return  # Already gone or claimed by hourly cycle
+            current.selling_pending = True
+
+        logger.info(
+            "SCANNER EXIT [%s]: '%s' — price=$%.3f, avg=$%.3f",
+            reason, pos.question[:40], current_price, pos.avg_price,
+        )
+        try:
+            asyncio.run(self.executor.execute_exit(
+                market_id=market_id,
+                token_id=pos.token_id,
+                question=pos.question,
+                shares=pos.shares,
+                price=current_price,
+                reason=reason,
+            ))
+        except Exception as e:
+            logger.error("Scanner exit failed for '%s': %s", pos.question[:40], e)
+            # Release the claim so the position can be retried
+            with self.portfolio._lock:
+                current = self.portfolio.positions.get(market_id)
+                if current is not None:
+                    current.selling_pending = False
 
     def shutdown(self):
         """Clean up resources."""

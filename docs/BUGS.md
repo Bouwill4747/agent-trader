@@ -269,8 +269,57 @@
 
 | Metric | Count |
 |--------|-------|
-| Total bugs | 26 |
-| Critical | 8 |
-| High | 10 |
-| Medium | 6 |
+| Total bugs | 31 |
+| Critical | 9 |
+| High | 12 |
+| Medium | 8 |
 | Low | 2 |
+
+### BUG-027: Drawdown check uses stale cash — HALTED not triggering
+- **Date**: 2026-03-04
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: High
+- **Symptom**: Agent showed drawdown 17.5% (RISK_REDUCING_ONLY) when actual drawdown was 21.5% (HALTED). New trades would have been permitted despite being over the 20% halt threshold.
+- **Root Cause**: `_generate_signals()` (step 3) checked `portfolio.drawdown_pct` before `_sync_cash_from_clob()` had run. Cash sync only ran in step 6. On startup, portfolio loaded from a 3-day-old snapshot with stale prices — total_value appeared ~$4 higher than reality, making drawdown appear 4pp lower.
+- **Fix**: Added `_sync_cash_from_clob()` call at the top of `_generate_signals()` before the `get_trading_mode()` check. Cash sync now runs at step 3 (before drawdown check) and step 6 (after exits). Idempotent, cheap.
+- **Lesson Learned**: Drawdown is only as accurate as the cash it's computed from. Any check that gates trading decisions must see current-cycle cash, not snapshot cash. Sync early.
+
+### BUG-028: Portfolio snapshots not saved during HALTED/RISK_REDUCING_ONLY periods
+- **Date**: 2026-03-04
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: High
+- **Symptom**: After restarting the agent, portfolio loaded a 3-day-old snapshot. Cash, position prices, and drawdown were all stale. Snapshots had not been saved since the last position exit on March 1.
+- **Root Cause**: `save_snapshot()` was inside the loop that handles position exits. When the agent is HALTED or RISK_REDUCING_ONLY (no new entries, no exits), the loop body never executes → no snapshot saved.
+- **Fix**: Moved `save_snapshot()` to an unconditional position at the end of `_monitor_positions()`, after `_sync_cash_from_clob()`. Snapshot now saves every cycle regardless of trading activity.
+- **Lesson Learned**: State persistence should never be conditional on trading activity. Snapshots are crash recovery insurance — they're most valuable during quiet periods where nothing changes.
+
+### BUG-029: Stale GTC BUY orders lock USDC indefinitely
+- **Date**: 2026-03-04
+- **File(s)**: `src/agent/orchestrator.py`, `src/utils/db.py`
+- **Severity**: Medium
+- **Symptom**: Persistent $7.03 cash drift. Portfolio tracker showed more cash than wallet held. Amy Klobuchar (×2 orders, $7.66 total) and Silver SI (×1 order, $2.17) GTC BUY orders from 6+ days ago had USDC locked in the CLOB. `_reconcile_gtc_orders()` kept checking them but never cancelled.
+- **Root Cause**: `_reconcile_gtc_orders()` had no timeout — it would check forever. Orders that went unfilled stayed `status='pending'` in the DB, locking USDC collateral that was invisible to the portfolio cash tracker.
+- **Fix**: Added `STALE_ORDER_DAYS = 3` threshold. Orders older than 3 days are looked up in `get_open_orders()` by token ID, then cancelled via `client.cancel_order(clob_order_id)`. If the order is already gone from CLOB (expired/rejected silently), it's marked `cancelled` in DB anyway. `get_pending_live_trades()` now returns `timestamp` for age calculation.
+- **Lesson Learned**: GTC orders on Polymarket can sit indefinitely. Without a timeout, locked USDC becomes invisible "ghost collateral" that inflates apparent cash. 3 days is a reasonable TTL — if a market hasn't filled in 3 days, it's unlikely to fill at that price.
+
+### BUG-030: `_close_orphaned_sells()` skips paper mode — ghost position persists
+- **Date**: 2026-03-04
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: Medium
+- **Symptom**: Hyperliquid position showed `[SELLING]` for 2+ cycles after BUG-030 fix was deployed. The ghost position was never cleaned up despite the fix being present.
+- **Root Cause**: The `_close_orphaned_sells()` function had `if self.executor.paper_mode: return` as its first guard, before building the `selling` list. In paper trading mode (the default), the function returned immediately on every call. Paper sells complete instantly — there are no real tokens to verify on the CLOB — so any `selling_pending=True` position in a paper portfolio is definitionally a stale snapshot artifact.
+- **Fix**: Moved the `selling = [...]` list construction to before the paper_mode check. Paper mode now closes all `selling_pending` positions immediately (no CLOB verification needed). Live mode path unchanged: still checks CLOB token balance and open orders before closing.
+- **Lesson Learned**: Guard clauses that skip entire functions can silently prevent the branch they were meant to protect. The paper-mode guard was intended to skip the CLOB balance check, not the entire function. Restructure guards to be as narrow as the behaviour they're protecting.
+
+### BUG-031: Portfolio missing filled positions — agent incorrectly HALTED
+- **Date**: 2026-03-04
+- **File(s)**: `src/agent/orchestrator.py`, `src/utils/db.py`
+- **Severity**: Critical
+- **Symptom**: Agent was HALTED at 22.7% drawdown. Polymarket showed 13 open positions worth ~$113 total. Agent tracked only 11 positions worth ~$97. Three real positions were invisible: Labour leadership (18.1 shares @ 60¢ = **$10.85**, +172%), Democrats NC Senate (11.8 shares @ 20¢ = $2.36), Taylor Swift (1.26 tracked vs 17.0 actual shares). Total untracked value: **~$16.38**. Actual drawdown was ~9.3%, not 22.7%.
+- **Root Cause (3 separate issues)**:
+  1. Labour (BUG-025 aftermath): position was purged when SELL failed (tokens were real, BUG-025 was the original bug). The BUG-025 fix added CLOB balance checking before purge but the already-purged position was never restored.
+  2. Democrats NC Senate: filled BUY trade in DB (`status='filled'`, `actual_outcome=NULL`) but never in portfolio. Likely restored at entry time but lost from snapshot during a crash/restart cycle.
+  3. Taylor Swift: DB shows 16.98 shares but snapshot had 1.26 — snapshot saved with wrong count, probably during a partial-reconcile window.
+- **Immediate Fix**: One-time script to insert a corrected portfolio snapshot with all 3 positions properly included, and bankroll recalculated from actual position values. Drawdown corrected: 22.4% → 9.3%.
+- **Structural Fix**: Added `_reconcile_missing_positions()` to orchestrator — runs each cycle in step 6. Queries all `status='filled' AND actual_outcome IS NULL` BUY trades, compares against portfolio, verifies CLOB token balance (≥1), then calls `restore_position()` for any genuine untracked positions. Added `get_open_filled_trades()` to `db.py`.
+- **Lesson Learned**: The portfolio snapshot is the sole source of truth on restart. Any bug that causes a position to be removed from the snapshot (purge, crash, partial write) will compound into incorrect drawdown, incorrect HALT decisions, and invisible P&L. A daily integrity check comparing DB trades against portfolio is essential for live trading.

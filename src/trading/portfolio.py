@@ -4,6 +4,7 @@ This is the agent's "bank account" — it knows what we own and what it's worth.
 """
 
 import json
+import threading
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 
@@ -24,6 +25,11 @@ class Position:
     shares: float       # Number of shares held
     avg_price: float    # Average entry price
     current_price: float = 0.0
+    estimated_prob: float = 0.0  # Claude's probability estimate at entry (0 = unknown)
+    # SELL reconciliation state — set when an exit order is placed but not yet confirmed filled
+    selling_pending: bool = False   # True = GTC SELL order is live in the book
+    sell_price: float = 0.0         # Price at which the SELL order was placed
+    selling_reason: str = ""        # "STOP_LOSS" or "TAKE_PROFIT"
 
     @property
     def cost_basis(self) -> float:
@@ -57,6 +63,7 @@ class Portfolio:
         self.realized_pnl = 0.0
         self.peak_bankroll = self.cash
         self.trade_count = 0
+        self._lock = threading.Lock()  # Guards selling_pending claims between scanner and hourly cycle
 
         logger.info("Portfolio initialized with $%.2f", self.cash)
 
@@ -65,7 +72,8 @@ class Portfolio:
     # ──────────────────────────────────────────────
 
     def open_position(self, market_id: str, token_id: str, question: str,
-                      side: str, shares: float, price: float):
+                      side: str, shares: float, price: float,
+                      estimated_prob: float = 0.0):
         """Record a new position or add to an existing one."""
 
         total_cost = shares * price
@@ -95,6 +103,7 @@ class Portfolio:
                 shares=shares,
                 avg_price=price,
                 current_price=price,
+                estimated_prob=estimated_prob,
             )
 
         self.cash -= total_cost
@@ -105,6 +114,79 @@ class Portfolio:
             market_id[:8], shares, side, price, total_cost, self.cash
         )
         return True
+
+    def restore_position(self, market_id: str, token_id: str, question: str,
+                         side: str, shares: float, price: float,
+                         estimated_prob: float = 0.0) -> bool:
+        """Add a GTC-filled position to the tracker without deducting cash.
+
+        Cash is NOT touched here — _sync_cash_from_clob() already corrected it
+        when the CLOB reserved collateral for the GTC order. Only call this when
+        the CLOB has confirmed we actually hold the tokens (balance > 0).
+
+        Returns True if the position was newly added, False if already tracked.
+        """
+        if market_id in self.positions:
+            return False
+
+        self.positions[market_id] = Position(
+            market_id=market_id,
+            token_id=token_id,
+            question=question,
+            side=side,
+            shares=shares,
+            avg_price=price,
+            current_price=price,
+            estimated_prob=estimated_prob,
+        )
+        logger.info(
+            "Restored GTC position: %s %.0f %s shares @ $%.3f",
+            market_id[:8], shares, side, price,
+        )
+        return True
+
+    def mark_selling(self, market_id: str, price: float, reason: str) -> bool:
+        """Flag a position as having a pending SELL order on the CLOB.
+
+        Called immediately after a live exit order is placed. The position
+        stays in the tracker (tokens still held until fill) but is marked so
+        the exit-check loop skips it and _reconcile_sell_orders() watches it.
+        Cash is NOT updated here — close_position() handles that when the fill
+        is confirmed.
+
+        Returns True if the position was found and marked, False otherwise.
+        """
+        pos = self.positions.get(market_id)
+        if not pos:
+            logger.warning("mark_selling: no position found for %s", market_id)
+            return False
+        pos.selling_pending = True
+        pos.sell_price = price
+        pos.selling_reason = reason
+        logger.info(
+            "Marked selling: %s %.0f %s shares @ $%.3f (%s) — awaiting CLOB fill",
+            market_id[:8], pos.shares, pos.side, price, reason,
+        )
+        return True
+
+    def purge_position(self, market_id: str) -> None:
+        """Remove a phantom position (GTC buy never filled) from the tracker.
+
+        Restores the cost_basis back to cash (the USDC was never actually spent
+        on tokens — it may still be reserved as GTC order collateral, but the
+        CLOB cash sync will correct the exact amount at end of cycle).
+        """
+        if market_id not in self.positions:
+            return
+        pos = self.positions[market_id]
+        # Return the allocated cost to cash so total_value stays consistent
+        # until the end-of-cycle CLOB sync overwrites it with the real balance.
+        self.cash += pos.cost_basis
+        del self.positions[market_id]
+        logger.warning(
+            "Purged phantom position: %s %.0f %s shares @ $%.3f (cost $%.2f — GTC order never filled)",
+            market_id[:8], pos.shares, pos.side, pos.avg_price, pos.cost_basis
+        )
 
     def close_position(self, market_id: str, price: float):
         """Close an entire position at the given price."""
@@ -239,6 +321,10 @@ class Portfolio:
                 "shares": pos.shares,
                 "avg_price": pos.avg_price,
                 "current_price": pos.current_price,
+                "estimated_prob": pos.estimated_prob,
+                "selling_pending": pos.selling_pending,
+                "sell_price": pos.sell_price,
+                "selling_reason": pos.selling_reason,
             }
         return json.dumps(positions_data)
 
@@ -258,6 +344,7 @@ class Portfolio:
         portfolio.realized_pnl = snapshot.get("realized_pnl", 0.0)
         portfolio.peak_bankroll = snapshot.get("peak_bankroll", INITIAL_BANKROLL)
         portfolio.trade_count = 0
+        portfolio._lock = threading.Lock()
 
         # Restore positions from JSON
         positions_json = snapshot.get("positions_json")
@@ -273,6 +360,10 @@ class Portfolio:
                         shares=pos_data["shares"],
                         avg_price=pos_data["avg_price"],
                         current_price=pos_data.get("current_price", pos_data["avg_price"]),
+                        estimated_prob=pos_data.get("estimated_prob") or 0.0,
+                        selling_pending=pos_data.get("selling_pending") or False,
+                        sell_price=pos_data.get("sell_price") or 0.0,
+                        selling_reason=pos_data.get("selling_reason") or "",
                     )
             except (json.JSONDecodeError, KeyError, TypeError) as e:
                 logger.error("Failed to restore positions from snapshot: %s", e)
@@ -320,10 +411,11 @@ class Portfolio:
         if self.positions:
             lines.append(f"  --- Open Positions ---")
             for pos in self.positions.values():
+                status = " [SELLING]" if pos.selling_pending else ""
                 lines.append(
                     f"  {pos.question[:35]:35s} | {pos.side:3s} | "
                     f"{pos.shares:.0f} @ ${pos.avg_price:.3f} | "
                     f"Now: ${pos.current_price:.3f} | "
-                    f"PnL: ${pos.unrealized_pnl:+.2f}"
+                    f"PnL: ${pos.unrealized_pnl:+.2f}{status}"
                 )
         return "\n".join(lines)

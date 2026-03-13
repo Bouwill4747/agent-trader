@@ -1008,3 +1008,160 @@ Added per-tier volume/liquidity thresholds and per-tier intra-cycle exposure cap
 
 ### Test Count
 177 tests, all passing (21 new).
+
+---
+
+## Session 23 — 2026-03-04: Background Price Scanner
+
+### Problem
+The hourly cycle creates a 59-minute blind spot between price updates. A position can spike to $0.97 (or collapse to $0.10) and the agent won't react until the next full cycle. The gold price spike example: if a YES token jumps to $0.97 on a news event, that's nearly a full resolution payout sitting unclaimed for up to 59 minutes.
+
+### Solution: Deterministic Background Scanner
+A daemon thread polls CLOB midpoint prices every 60 seconds. No Claude API calls — pure price logic. The scanner adds a second "speed layer" on top of the hourly "intelligence layer":
+
+```
+Speed layer (60s):   RESOLVED spikes, structural collapses, confirmed take-profits
+Intelligence layer:  Stop-losses, new entries, risk assessment, calibration logging
+```
+
+### Tiered Exit Logic
+
+| Tier | Signal | Condition | Confirmation |
+|------|--------|-----------|--------------|
+| 1a | RESOLVED_SCANNER | price ≥ 0.95 or ≤ 0.05 | Immediate |
+| 1b | STRUCTURAL_COLLAPSE | price ≤ avg_price × 50% | Immediate |
+| 1c | TAKE_PROFIT | `_check_exit()` returns TAKE_PROFIT | 2 consecutive scans |
+| (2) | STOP_LOSS | price ≤ avg_price × 75% | Left to hourly cycle |
+
+Stop-loss is intentionally excluded from the scanner — it's a slow exit that benefits from the full hourly context check (Gamma verification, portfolio snapshot, calibration log). The scanner is for capturing fast positive moves.
+
+### Concurrency Safety
+- `Portfolio._lock = threading.Lock()` added — guards atomic check+set of `selling_pending`
+- Scanner's `_scanner_trigger_exit()`: acquires lock, checks+sets `selling_pending=True`, releases lock, then calls `execute_exit()` outside the lock
+- Hourly `_monitor_positions()` RESOLVED path: acquires lock after Gamma confirms closed, claims position before calling `resolve_position()`
+- Hourly `_monitor_positions()` STOP_LOSS/TAKE_PROFIT path: acquires lock before `execute_exit()` call
+- If `execute_exit()` raises, scanner releases `selling_pending=False` so position can retry
+- Pattern: **never hold a lock during HTTP calls** (only during flag check+set)
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `config/settings.py` | Added `PRICE_SCAN_INTERVAL_SECONDS=60`, `SCANNER_HARD_LOSS_PCT=0.50`, `SCANNER_TAKE_PROFIT_CONFIRMATIONS=2` |
+| `src/trading/portfolio.py` | Added `import threading`; `self._lock = threading.Lock()` in `__init__()` and `load_from_db()` |
+| `src/agent/orchestrator.py` | Added `import threading, time`, `from collections import defaultdict`; scanner settings import; `_scanner_running`, `_take_profit_hits` state in `__init__`; four new methods: `_start_price_scanner()`, `_price_scan_loop()`, `_run_price_scan()`, `_scanner_exit_check()`, `_scanner_trigger_exit()`; scanner started in `run()` after portfolio restore; atomic claiming via lock in `_monitor_positions()` |
+| `tests/test_price_scanner.py` | New file, 21 tests |
+
+### Test Count
+198 tests, all passing (21 new).
+
+### Practical Impact
+- Gold-price-spike scenario: scanner catches $0.96 price within 60s → RESOLVED_SCANNER exit
+- Structural collapse (bad news flash): scanner exits at 50% loss vs up to 59-min wait
+- Take-profit confirmed: two consecutive scans at take-profit level avoids exiting on transient spike
+- Scanner cost: 12 CLOB midpoint calls/min for 12 open positions — trivial vs. CLOB rate limit of 10 req/s
+
+---
+
+## Session 24 — 2026-03-04: Two-Phase LLM Prompt + Directional Bias Fix
+
+### Problem
+After the de-anchoring fix (Session 20), the LLM stopped seeing the market price entirely. Side effect: Claude defaults to base-rate conservatism → always estimates below market → generates BUY_NO on nearly every market. Analysis of 12 closed trades and 12 open positions confirmed: 10/12 closed and all 12 open were NO direction. Zero YES positions since de-anchoring. Win rate 8%.
+
+### Root Cause Analysis
+De-anchoring (removing price from prompt) solved one problem (LLM echoing market price → zero edge) but created another (LLM always below market → BUY_NO bias). The LLM needs to be an **information discovery engine** (what do the news articles tell us that the market doesn't know?), not a numerical probability calibrator.
+
+### Solution: Two-Phase Prompt
+**Phase 1** (unchanged from before): LLM estimates probability from evidence only, no market price shown. Preserves anti-anchoring.
+
+**Phase 2** (new): Market price revealed at bottom of prompt. LLM asked: if difference > 25pp, "what does the market know that I don't?" LLM may adjust toward market (if it finds a genuine blind spot) or keep its estimate (if it has strong evidence). Prevents systematic bias while preventing blind convergence.
+
+### Signal Direction Logging
+Added BUY_YES/BUY_NO/SKIP distribution log per cycle:
+```
+Signals: BUY_YES=3  BUY_NO=2  SKIP=5  (NO_ratio=40%)
+```
+Acts as a canary — if NO_ratio stays persistently at 80-100%, prompt bias is back.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/analysis/llm_researcher.py` | Restructured `SYSTEM_PROMPT` for two-phase methodology; updated `ANALYSIS_TEMPLATE` to reveal `{market_price_pct}` at bottom of prompt; `analyze_market()` now formats and passes `current_price` into template |
+| `src/agent/orchestrator.py` | `_generate_signals()` now counts BUY_YES/BUY_NO/SKIP and logs direction distribution with NO_ratio |
+
+### Test Count
+198 tests, all passing (no new tests — prompt changes aren't unit-testable without live API calls).
+
+---
+
+## Session 24b — 2026-03-04: Drawdown Timing Fix + Data Source Cleanup
+
+### Bugs Fixed
+
+**BUG-027: HALTED mode not triggering when it should**
+- Root cause: `_generate_signals()` checks `drawdown_pct` before `_sync_cash_from_clob()` runs (which only ran in step 6). On startup, portfolio loads with stale prices from the DB snapshot, making total_value appear higher → drawdown appears lower → HALTED mode doesn't trigger.
+- Real scenario: actual drawdown 21.5%, stale drawdown 17.5% → agent entered RISK_REDUCING_ONLY instead of HALTED.
+- Fix: Call `_sync_cash_from_clob()` at the top of `_generate_signals()` (step 3) before the drawdown check. Cash sync now runs twice per cycle (step 3 + step 6) — cheap (one CLOB call) and idempotent.
+
+### Data Sources Disabled
+- **Metaculus**: Disabled — 403/429 on every call. Was blocking all requests.
+- **Google Trends**: Disabled — `TooManyRequestsError` on all calls, adding ~30s of wasted wait time per cycle.
+
+Both are commented out with re-enable instructions. RSS + Finnhub + FRED cover the gap.
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/agent/orchestrator.py` | Added `_sync_cash_from_clob()` call at top of `_generate_signals()`; replaced Metaculus and Google Trends blocks with disable comments |
+
+---
+
+## Session 24c — 2026-03-04: Snapshot + Stale GTC + Keyword Fixes
+
+### Bugs Fixed
+
+**BUG-028: Portfolio snapshots not saved when no exits occur**
+- Root cause: `save_snapshot()` was inside the exit-handling loop, so it only ran when positions were exited. In HALTED/RISK_REDUCING_ONLY mode (no new trades, no exits), no snapshots were saved for 3 days — the agent was loading a 3-day-old snapshot on every restart with stale prices and wrong cash.
+- Fix: Moved `save_snapshot()` to run unconditionally after `_sync_cash_from_clob()` at the end of `_monitor_positions()`. Snapshot is now saved every cycle regardless of activity.
+
+**BUG-029: Stale GTC BUY orders lock USDC indefinitely**
+- Root cause: `_reconcile_gtc_orders()` correctly detected open orders but had no timeout — it would keep checking forever. 3 orders (Amy Klobuchar ×2 = $7.66, Silver SI ×1 = $2.17) were sitting in the CLOB for days with locked USDC collateral, causing a persistent $7 cash drift.
+- Fix: Added `STALE_ORDER_DAYS = 3` threshold. Orders older than 3 days are cancelled via `self.client.cancel_order(clob_order_id)` using the CLOB order ID looked up from `get_open_orders()`. If the order is already gone but not filled, marks as cancelled. Releases locked USDC back to wallet.
+
+**Filter additions**
+- Added `"truth social"` to `SKIP_MARKET_KEYWORDS` — Trump Truth Social post-count markets (same structure as Elon Musk tweet-count, unanswerable).
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/agent/orchestrator.py` | `_reconcile_gtc_orders()`: added `open_order_id_by_token` lookup dict; added stale-order cancellation for orders ≥3 days old; moved `save_snapshot()` to unconditional post-cash-sync position |
+| `src/utils/db.py` | `get_pending_live_trades()`: added `timestamp` to SELECT for age calculation |
+| `config/settings.py` | Added `"truth social"` to `SKIP_MARKET_KEYWORDS` |
+
+---
+
+## Session 24d — 2026-03-04: Orphaned Sell Fix (Paper Mode) + Sports Filter Gaps
+
+### Bugs Fixed
+
+**BUG-030 (paper mode): `_close_orphaned_sells()` skipped in paper trading**
+- Symptom: Hyperliquid `[SELLING]` ghost persisted for 2+ cycles despite the fix being deployed in 24c.
+- Root cause: Function had `if self.executor.paper_mode: return` as its first statement, before building the `selling` list. In paper mode (the default), it returned immediately without checking anything. Paper sells complete instantly — any `selling_pending=True` is definitionally stale.
+- Fix: Moved the `selling` list construction before the `paper_mode` check. Paper mode now closes all `selling_pending` positions immediately (no CLOB verification). Live mode: unchanged (CLOB balance check still applies).
+
+### Filter Gaps Fixed
+Sports/combat markets were slipping through `SKIP_MARKET_KEYWORDS`:
+| Market | Missing keyword | Added |
+|--------|----------------|-------|
+| "Will Evansville win the 2026 MVC conference championship?" | "championship" | `"championship"` |
+| "Will Robert MacIntyre win the 2026 Masters tournament?" | "masters tournament" | `"masters tournament"` |
+| "Will Charles Oliveira win by KO/TKO?" | none of "ufc","mma fight" present | `"ko/tko"`, `"by submission"` |
+| Generic cup/league wins | partial coverage | `"win the cup"`, `"win the league"` |
+
+### Files Changed
+| File | Change |
+|------|--------|
+| `src/agent/orchestrator.py` | Restructured `_close_orphaned_sells()`: check `selling_pending` positions first, then branch on `paper_mode` vs live |
+| `config/settings.py` | Added 6 sports keywords: `"championship"`, `"masters tournament"`, `"win the cup"`, `"win the league"`, `"ko/tko"`, `"by submission"` |
+
+### Test Count
+198 tests, all passing.
