@@ -99,7 +99,13 @@ def main():
         if "--once" in sys.argv:
             logger.info("Running single cycle (--once flag)")
             async def _run_once():
+                from src.trading.portfolio import Portfolio
                 await init_db()
+                restored = await Portfolio.load_from_db()
+                if restored:
+                    agent.portfolio = restored
+                    agent.executor.portfolio = restored
+                    logger.info("Portfolio restored from previous session")
                 await agent.run_cycle()
             asyncio.run(_run_once())
         else:

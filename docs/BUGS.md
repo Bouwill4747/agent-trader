@@ -265,15 +265,71 @@
 
 ---
 
+### BUG-032: Scanner RESOLVED exit bypasses Gamma verification — sells at $0.97 instead of $1.00
+- **Date**: 2026-03-14
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: Critical
+- **Symptom**: The background price scanner fired `RESOLVED_SCANNER` and sold positions as soon as the token price hit 0.95, before the market actually closed. A NO token at $0.97 would be sold immediately instead of waiting for the $1.00 payout on settlement — a $0.03/share leak on every winning position.
+- **Root Cause**: `_scanner_exit_check()` triggered `RESOLVED_SCANNER` immediately on price threshold with no Gamma API check. The hourly cycle (`_monitor_positions()`) correctly calls `get_market_by_id()` and checks `closed == True` before acting (BUG-026 fix). The scanner never had an equivalent guard.
+- **Fix**: Added `get_market_by_id()` + `market_info.get("closed", False)` check inside `_scanner_exit_check()` Tier 1a, mirroring the hourly cycle logic. If Gamma is unreachable or market is not yet closed, the scanner holds and lets the hourly cycle handle it.
+- **Lesson Learned**: Any code path that can trigger a sell must independently verify resolution. The hourly cycle and the scanner are both capable of exiting positions — both must share the same verification logic. Assume nothing about what the other path does.
+
+### BUG-033: `selling_pending` stuck forever on CLOB soft failure — position becomes untradeable
+- **Date**: 2026-03-14
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: High
+- **Symptom**: After a failed take-profit sell (e.g. Taylor Swift NO on 2026-03-14), `selling_pending=True` was never cleared. The position became permanently locked: the scanner skipped it (`if pos.selling_pending: continue`) and the hourly cycle also skipped it. The position sat frozen indefinitely with unrealized gains.
+- **Root Cause**: `_scanner_trigger_exit()` only reset `selling_pending = False` inside the `except Exception` block (hard failure / network error). When `execute_exit()` returned normally with `result.success = False` (CLOB rejected the order without raising an exception), no reset happened. The try block exited cleanly with `selling_pending` still True.
+- **Fix**: Added `selling_pending = False` reset inside the try block when `result and not result.success`. The position is now unlocked for retry on the next scan or next hourly cycle.
+- **Lesson Learned**: `selling_pending` is a claim flag. It must be released on ALL failure paths — not just exceptions. A function that returns `success=False` without throwing is just as much a failure as one that throws. When using try/except to manage state, audit every exit path (normal return, falsy return, exception) for cleanup.
+
+### BUG-034: Missing try/except on live BUY — network error leaves CLOB order placed but agent unaware
+- **Date**: 2026-03-14
+- **File(s)**: `src/trading/executor.py`
+- **Severity**: High
+- **Symptom**: If a network error occurred after `place_order()` sent the request but before the response arrived, the CLOB order would exist on-chain but the agent would crash without recording it. The position would never be tracked, and USDC would be locked in an invisible order.
+- **Root Cause**: `_live_execute()` called `self.client.place_order()` with no try/except. Unlike `_live_exit()` which wrapped its `place_order()` call in try/except (added in BUG-019 fix), the BUY path was never given the same treatment.
+- **Fix**: Wrapped `place_order()` in `_live_execute()` with try/except, logging the exception and returning `OrderResult(success=False)`. Mirrors the existing pattern in `_live_exit()`.
+- **Lesson Learned**: Symmetric code paths need symmetric error handling. BUY and SELL both call `place_order()` — both must handle its failure modes. When fixing a bug in one path, always check if the paired path has the same issue.
+
+### BUG-035: Negative cash on portfolio restore — snapshot race condition with scanner price updates
+- **Date**: 2026-03-14
+- **File(s)**: `src/trading/portfolio.py`
+- **Severity**: High
+- **Symptom**: On agent restart, `portfolio.cash` could be computed as a negative value. This would cause `total_value` to undercount the portfolio, trigger inflated drawdown calculations, and potentially falsely enter HALTED mode.
+- **Root Cause**: `load_from_db()` computes `cash = bankroll - position_value` where `position_value` uses `pos.current_price` restored from `positions_json`. The snapshot's `bankroll` and `positions_json` are written in the same `save_snapshot()` call but NOT atomically — the scanner thread can update `pos.current_price` between when `self.total_value` (which becomes `bankroll`) is computed and when `_positions_to_json()` is called. If prices moved up between those two lines, `positions_json` captures higher prices than `bankroll` was computed with, making `cash = bankroll - position_value` go negative.
+- **Fix**: Added `max(0.0, ...)` clamp: `portfolio.cash = max(0.0, snapshot.get("bankroll", INITIAL_BANKROLL) - position_value)`. Prevents negative cash; self-corrects on first price scan.
+- **Lesson Learned**: Snapshot saves that read multiple mutable fields without a lock are not atomic. The scanner thread is always racing. Either hold the lock for the entire snapshot write, or clamp/validate derived values on read. The clamp is the minimal safe fix; the real fix is atomic snapshot capture.
+
+### BUG-036: `--once` mode skips portfolio restore — runs with blank portfolio, can duplicate positions
+- **Date**: 2026-03-14
+- **File(s)**: `main.py`
+- **Severity**: Medium
+- **Symptom**: Running `python main.py --once` called `run_cycle()` directly without first restoring the portfolio from the database. The agent ran a full cycle with an empty portfolio — seeing 0 positions, 0 exposure — and could have opened duplicate positions for markets already held, or approved trades that would breach exposure limits.
+- **Root Cause**: `agent.run()` performs portfolio restore before starting the cycle loop (added in BUG-012 fix). The `--once` path in `main.py` bypassed `run()` entirely and called `run_cycle()` directly, skipping the restore step.
+- **Fix**: Added `Portfolio.load_from_db()` call to the `--once` async block in `main.py`, setting `agent.portfolio` and `agent.executor.portfolio` before `run_cycle()`. Mirrors what `run()` does.
+- **Lesson Learned**: Any alternative entry point that bypasses the normal startup sequence inherits all the risks of skipping those steps. When adding shortcuts like `--once`, explicitly check which setup steps they need and add them. Don't assume the shortcut shares setup with the normal path.
+
+### BUG-037: `drawdown_pct` mutates `peak_bankroll` without a lock — race condition with scanner thread
+- **Date**: 2026-03-14
+- **File(s)**: `src/trading/portfolio.py`
+- **Severity**: Low
+- **Symptom**: No observed crash, but a latent race condition. The scanner thread calls `pos.current_price` updates continuously. If `drawdown_pct` is called from the main thread while the scanner is running, the read-modify-write on `self.peak_bankroll` is not atomic — a concurrent scanner price update could produce an inconsistent peak value.
+- **Root Cause**: `drawdown_pct` is a property with a side effect: it updates `self.peak_bankroll = current` when a new high is reached. This mutation happens without holding `self._lock`. Python's GIL protects individual bytecode operations but not compound read-check-write sequences involving method calls like `self.total_value`.
+- **Fix**: Wrapped the peak update and drawdown calculation inside `with self._lock:`.
+- **Lesson Learned**: Properties that mutate state are fragile under concurrent access. If a `@property` has side effects, it needs the same thread protection as any other mutation. When in doubt about GIL safety for compound operations, use the lock.
+
+---
+
 ## Stats
 
 | Metric | Count |
 |--------|-------|
-| Total bugs | 31 |
-| Critical | 9 |
-| High | 12 |
-| Medium | 8 |
-| Low | 2 |
+| Total bugs | 37 |
+| Critical | 10 |
+| High | 15 |
+| Medium | 9 |
+| Low | 3 |
 
 ### BUG-027: Drawdown check uses stale cash — HALTED not triggering
 - **Date**: 2026-03-04

@@ -198,12 +198,20 @@ class Executor:
             side, shares, price, question[:40]
         )
 
-        response = self.client.place_order(
-            token_id=token_id,
-            price=price,
-            size=shares,
-            side=side,
-        )
+        try:
+            response = self.client.place_order(
+                token_id=token_id,
+                price=price,
+                size=shares,
+                side=side,
+            )
+        except Exception as e:
+            logger.error("[LIVE] BUY order exception for %s: %s", question[:40], e)
+            return OrderResult(
+                success=False, order_id="", fill_price=0,
+                fill_size=0, paper_trade=False,
+                message=f"BUY order exception: {e}",
+            )
 
         if response:
             order_id = response.get("orderID", response.get("id", "unknown"))
@@ -226,7 +234,7 @@ class Executor:
                 filled=filled,
             )
         else:
-            logger.error("[LIVE] Order failed for %s", question[:40])
+            logger.error("[LIVE] Order failed for %s — CLOB response: %r", question[:40], response)
             return OrderResult(
                 success=False, order_id="", fill_price=0,
                 fill_size=0, paper_trade=False,
@@ -362,7 +370,7 @@ class Executor:
                 message=f"Live exit order placed: {order_id} ({reason})",
             )
         else:
-            logger.error("[LIVE] SELL order failed for %s", question[:40])
+            logger.error("[LIVE] SELL order failed for %s — CLOB response: %r", question[:40], response)
             return OrderResult(
                 success=False, order_id="", fill_price=0,
                 fill_size=0, paper_trade=False,

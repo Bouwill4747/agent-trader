@@ -285,12 +285,13 @@ class Portfolio:
     def drawdown_pct(self) -> float:
         """Current drawdown from peak portfolio value, as a percentage."""
         current = self.total_value
-        if current > self.peak_bankroll:
-            self.peak_bankroll = current
-            return 0.0
-        if self.peak_bankroll == 0:
-            return 0.0
-        return (self.peak_bankroll - current) / self.peak_bankroll
+        with self._lock:
+            if current > self.peak_bankroll:
+                self.peak_bankroll = current
+                return 0.0
+            if self.peak_bankroll == 0:
+                return 0.0
+            return (self.peak_bankroll - current) / self.peak_bankroll
 
     @property
     def exposure_pct(self) -> float:
@@ -368,9 +369,11 @@ class Portfolio:
             except (json.JSONDecodeError, KeyError, TypeError) as e:
                 logger.error("Failed to restore positions from snapshot: %s", e)
 
-        # Restore cash: bankroll (total value) minus position values
+        # Restore cash: bankroll (total value) minus position values.
+        # Clamp to 0 in case of a snapshot race condition (scanner updating
+        # current_price between bankroll and positions_json being written).
         position_value = sum(pos.current_value for pos in portfolio.positions.values())
-        portfolio.cash = snapshot.get("bankroll", INITIAL_BANKROLL) - position_value
+        portfolio.cash = max(0.0, snapshot.get("bankroll", INITIAL_BANKROLL) - position_value)
 
         logger.info(
             "Portfolio restored from DB: $%.2f cash, %d positions, $%.2f realized PnL",

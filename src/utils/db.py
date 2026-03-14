@@ -3,6 +3,7 @@ SQLite database for persisting trades, signals, and portfolio state.
 Uses aiosqlite for async access — the agent can do other work while DB writes complete.
 """
 
+import sqlite3
 import aiosqlite
 from config.settings import DATABASE_PATH
 from src.utils.logger import setup_logger
@@ -74,6 +75,21 @@ async def init_db():
                 signals_generated INTEGER DEFAULT 0,
                 trades_executed INTEGER DEFAULT 0,
                 errors TEXT
+            )
+        """)
+
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS scanner_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                market_id TEXT NOT NULL,
+                question TEXT,
+                trigger TEXT NOT NULL,
+                price REAL,
+                avg_price REAL,
+                shares REAL,
+                order_success INTEGER,
+                error TEXT
             )
         """)
 
@@ -459,3 +475,52 @@ async def get_agent_run_stats() -> dict:
             "total_signals": row[4],
             "total_trades": row[5],
         }
+
+
+# ---------------------------------------------------------------------------
+# Sync helpers for scanner_events — called from the background scanner thread.
+# Using plain sqlite3 (not aiosqlite) because the scanner runs in a regular
+# thread, not an async context.
+# ---------------------------------------------------------------------------
+
+def sync_insert_scanner_event(event: dict) -> None:
+    """Record a price-scanner exit trigger (take-profit, stop-loss, resolved, etc.).
+
+    Only called when something actionable happens — not on every scan tick.
+    Fields: timestamp, market_id, question, trigger, price, avg_price, shares,
+            order_success (1/0/None), error (str or None).
+    """
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            conn.execute("""
+                INSERT INTO scanner_events
+                    (timestamp, market_id, question, trigger, price, avg_price,
+                     shares, order_success, error)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                event.get("timestamp"),
+                event.get("market_id"),
+                event.get("question"),
+                event.get("trigger"),
+                event.get("price"),
+                event.get("avg_price"),
+                event.get("shares"),
+                event.get("order_success"),
+                event.get("error"),
+            ))
+            conn.commit()
+    except Exception as e:
+        logger.warning("Failed to insert scanner_event: %s", e)
+
+
+def sync_prune_scanner_events(days: int = 30) -> None:
+    """Delete scanner_events older than `days` days. Call once per scan loop."""
+    try:
+        with sqlite3.connect(DATABASE_PATH) as conn:
+            conn.execute(
+                "DELETE FROM scanner_events WHERE timestamp < datetime('now', ?)",
+                (f"-{days} days",),
+            )
+            conn.commit()
+    except Exception as e:
+        logger.warning("Failed to prune scanner_events: %s", e)

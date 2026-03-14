@@ -56,7 +56,7 @@ from src.utils.db import (
     init_db, insert_agent_run, update_agent_run, update_trade_outcome,
     get_pending_live_trades, get_pending_sell_trades, get_open_filled_trades,
     mark_trade_status, get_calibration_stats, get_trade_summary,
-    get_open_position_themes,
+    get_open_position_themes, sync_insert_scanner_event, sync_prune_scanner_events,
 )
 
 logger = setup_logger("orchestrator")
@@ -210,6 +210,7 @@ class Orchestrator:
         # Price scanner state
         self._scanner_running = False
         self._take_profit_hits: dict[str, int] = defaultdict(int)
+        self._last_prune_time: float = 0.0
 
         # Build the LangGraph workflow
         self.graph = self._build_graph()
@@ -1561,6 +1562,10 @@ class Orchestrator:
 
     def _run_price_scan(self) -> None:
         """Fetch midpoint prices for open positions and evaluate exit conditions."""
+        if time.time() - self._last_prune_time > 3600:
+            sync_prune_scanner_events(days=30)
+            self._last_prune_time = time.time()
+
         # Snapshot market IDs under lock — avoids iterating a live dict
         with self.portfolio._lock:
             market_ids = list(self.portfolio.positions.keys())
@@ -1589,9 +1594,24 @@ class Orchestrator:
           1c TAKE_PROFIT         — _check_exit confirms TP twice  → exit
           (STOP_LOSS is ignored here — handled by the hourly cycle)
         """
-        # Tier 1a: market effectively resolved
+        # Tier 1a: market effectively resolved — verify via Gamma before selling
+        # to avoid exiting at $0.97 when the market hasn't actually closed yet.
+        # (The hourly cycle does the same check — BUG-031)
         if (current_price >= EXIT_RESOLVED_THRESHOLD or
                 current_price <= (1 - EXIT_RESOLVED_THRESHOLD)):
+            market_info = self.client.get_market_by_id(market_id)
+            if market_info is None:
+                logger.debug(
+                    "RESOLVED_SCANNER for '%s' (price=%.3f) — Gamma unreachable, holding",
+                    pos.question[:40], current_price,
+                )
+                return
+            if not market_info.get("closed", False):
+                logger.debug(
+                    "RESOLVED_SCANNER for '%s' (price=%.3f) — market not closed yet, holding",
+                    pos.question[:40], current_price,
+                )
+                return
             self._scanner_trigger_exit(market_id, pos, current_price, "RESOLVED_SCANNER")
             return
 
@@ -1627,8 +1647,21 @@ class Orchestrator:
             "SCANNER EXIT [%s]: '%s' — price=$%.3f, avg=$%.3f",
             reason, pos.question[:40], current_price, pos.avg_price,
         )
+
+        event = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "market_id": market_id,
+            "question": pos.question,
+            "trigger": reason,
+            "price": current_price,
+            "avg_price": pos.avg_price,
+            "shares": pos.shares,
+            "order_success": None,
+            "error": None,
+        }
+
         try:
-            asyncio.run(self.executor.execute_exit(
+            result = asyncio.run(self.executor.execute_exit(
                 market_id=market_id,
                 token_id=pos.token_id,
                 question=pos.question,
@@ -1636,13 +1669,26 @@ class Orchestrator:
                 price=current_price,
                 reason=reason,
             ))
+            event["order_success"] = 1 if (result and result.success) else 0
+            if result and not result.success:
+                event["error"] = result.message
+                # Order returned but failed (e.g. CLOB rejected) — release the
+                # claim so the hourly cycle or next scan can retry.
+                with self.portfolio._lock:
+                    current = self.portfolio.positions.get(market_id)
+                    if current is not None:
+                        current.selling_pending = False
         except Exception as e:
             logger.error("Scanner exit failed for '%s': %s", pos.question[:40], e)
+            event["order_success"] = 0
+            event["error"] = str(e)
             # Release the claim so the position can be retried
             with self.portfolio._lock:
                 current = self.portfolio.positions.get(market_id)
                 if current is not None:
                     current.selling_pending = False
+        finally:
+            sync_insert_scanner_event(event)
 
     def shutdown(self):
         """Clean up resources."""
