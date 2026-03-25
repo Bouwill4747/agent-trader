@@ -543,7 +543,7 @@ class PolymarketClient:
         try:
             resp = httpx.get(
                 "https://data-api.polymarket.com/positions",
-                params={"user": wallet_address, "sizeThreshold": "0.5"},
+                params={"user": wallet_address, "sizeThreshold": "1.0"},
                 timeout=15,
             )
             resp.raise_for_status()

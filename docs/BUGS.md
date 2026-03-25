@@ -355,16 +355,25 @@
 - **Fix**: Added `_reconcile_full_wallet()` that calls `data-api.polymarket.com/positions` every 5 cycles to fetch all wallet token holdings. Compares against tracked positions and: (1) purges zombies with no wallet balance, (2) corrects share counts where wallet < tracked (partial fills), (3) adds untracked positions found in wallet. Added `get_wallet_positions()` to `PolymarketClient` and `get_market_id_for_token()` for Gamma lookup. Added `_cycle_count` counter to orchestrator.
 - **Lesson Learned**: Event-driven tracking ("track what I did") always drifts from truth. Periodically verify state against ground truth (the actual wallet). The wallet is always right. Build reconcilers that start from the wallet, not from internal state.
 
+### BUG-042: SELL order uses tracked shares instead of actual CLOB balance — leaves dust
+- **Date**: 2026-03-25
+- **File(s)**: `src/trading/executor.py`
+- **Severity**: Medium
+- **Symptom**: After every SELL, a fractional remainder (0.x shares) is left in the wallet and never sold. E.g. Taylor Swift left 1.0 share, Gold left 1.0 share, Silver $95 left 0.9 shares, Ilhan Omar left 0.8 shares.
+- **Root Cause**: `_live_exit()` called `math.floor(pos.shares)` where `pos.shares` is the agent's tracked count — which itself may be stale (from fractional BUY fills, partial SELLs, or fee deductions). Using a tracked number that's already potentially wrong as the basis for flooring means we systematically sell fewer shares than we actually hold. The CLOB is the only source of truth for how many tokens are held.
+- **Fix**: In `_live_exit()`, call `get_token_balance(token_id)` before flooring. Use the actual CLOB balance as the share count if available and within range. `math.floor(actual_balance)` then gives the maximum integer shares we can sell, minimising leftover dust. The irreducible 0.x fractional remainder is a CLOB limitation (integer-only orders) and will auto-redeem at market resolution.
+- **Lesson Learned**: Always use the CLOB balance — not tracked state — as the source of truth when placing exit orders. Tracked state is an approximation; the CLOB is ground truth.
+
 ---
 
 ## Stats
 
 | Metric | Count |
 |--------|-------|
-| Total bugs | 41 |
+| Total bugs | 42 |
 | Critical | 10 |
 | High | 18 |
-| Medium | 10 |
+| Medium | 11 |
 | Low | 3 |
 
 ### BUG-027: Drawdown check uses stale cash — HALTED not triggering

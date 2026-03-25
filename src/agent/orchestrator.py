@@ -1247,6 +1247,15 @@ class Orchestrator:
                 question[:50], wp["shares"], side, avg_price,
             )
 
+            import math
+            floored_shares = math.floor(wp["shares"])
+            if floored_shares < 1:
+                logger.info(
+                    "WALLET RECONCILE: skipping '%s' — dust position (%.2f shares, < 1 whole share)",
+                    question[:45], wp["shares"],
+                )
+                continue
+
             # Verify live midpoint before restoring (skip resolved markets)
             midpoint = self.client.get_midpoint(token_id)
             if midpoint is None:
@@ -1256,7 +1265,6 @@ class Orchestrator:
                 )
                 continue
 
-            import math
             restored = self.portfolio.restore_position(
                 market_id=market_id,
                 token_id=token_id,
@@ -1270,7 +1278,7 @@ class Orchestrator:
                 self.portfolio.positions[market_id].current_price = midpoint or current_price
                 logger.info(
                     "WALLET RECONCILE: restored '%s' — %d %s shares @ $%.3f",
-                    question[:45], math.floor(wp["shares"]), side, avg_price,
+                    question[:45], floored_shares, side, avg_price,
                 )
 
         logger.info(

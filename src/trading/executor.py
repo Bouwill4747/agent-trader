@@ -337,14 +337,22 @@ class Executor:
     ) -> OrderResult:
         """Place a real SELL order on the Polymarket CLOB."""
         import math
-        # CLOB only accepts integer share counts. Kelly sizing produces fractions
-        # and GTC fills may return slightly fewer tokens than ordered — floor to
-        # the nearest whole number so we never try to sell more than we hold.
+        # Use the actual CLOB balance as the source of truth for share count.
+        # Tracked pos.shares can drift from reality (partial fills, fee deductions).
+        # Flooring the real balance minimises leftover dust while never over-selling.
+        actual_balance = self.client.get_token_balance(token_id)
+        if actual_balance is not None and actual_balance >= 0.5:
+            if abs(actual_balance - shares) > 0.01:
+                logger.info(
+                    "[LIVE] SELL: using CLOB balance %.4f instead of tracked %.4f for '%s'",
+                    actual_balance, shares, question[:40],
+                )
+            shares = actual_balance
         shares = math.floor(shares)
         if shares < 1:
             logger.warning(
-                "[LIVE] SELL skipped for '%s' — floored shares < 1 (%.3f → 0)",
-                question[:40], shares,
+                "[LIVE] SELL skipped for '%s' — floored shares < 1 (balance=%.3f)",
+                question[:40], actual_balance or 0,
             )
             return OrderResult(
                 success=False, order_id="", fill_price=0,
