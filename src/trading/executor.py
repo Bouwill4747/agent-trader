@@ -336,8 +336,38 @@ class Executor:
         shares: float, price: float, reason: str
     ) -> OrderResult:
         """Place a real SELL order on the Polymarket CLOB."""
+        import math
+        # CLOB only accepts integer share counts. Kelly sizing produces fractions
+        # and GTC fills may return slightly fewer tokens than ordered — floor to
+        # the nearest whole number so we never try to sell more than we hold.
+        shares = math.floor(shares)
+        if shares < 1:
+            logger.warning(
+                "[LIVE] SELL skipped for '%s' — floored shares < 1 (%.3f → 0)",
+                question[:40], shares,
+            )
+            return OrderResult(
+                success=False, order_id="", fill_price=0,
+                fill_size=0, paper_trade=False,
+                message="SELL skipped: floored share count < 1",
+            )
+
+        # Price strategy depends on exit reason:
+        #   STOP_LOSS  → use the best bid for immediate fill (speed over price)
+        #   TAKE_PROFIT → use the midpoint (better price; stale-order logic will
+        #                 step down toward bid if it doesn't fill within a cycle)
+        if reason == "STOP_LOSS":
+            bid = self.client.get_best_bid(token_id)
+            if bid and bid > 0:
+                if abs(bid - price) > 0.001:
+                    logger.info(
+                        "[LIVE] STOP_LOSS: using best bid $%.3f (midpoint $%.3f) for immediate fill",
+                        bid, price,
+                    )
+                price = bid
+
         logger.info(
-            "[LIVE] Placing SELL order: %.0f shares @ $%.3f — %s (reason: %s)",
+            "[LIVE] Placing SELL order: %d shares @ $%.3f — %s (reason: %s)",
             shares, price, question[:40], reason
         )
 

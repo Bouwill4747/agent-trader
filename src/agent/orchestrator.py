@@ -41,9 +41,7 @@ from src.data.polymarket_client import PolymarketClient
 from src.data.news_collector import NewsCollector
 from src.data.rss_collector import RSSCollector
 from src.data.stocktwits_collector import StocktwitsCollector
-from src.data.trends_collector import TrendsCollector
 from src.data.coingecko_collector import CoinGeckoCollector
-from src.data.metaculus_collector import MetaculusCollector
 from src.data.fear_greed_collector import FearGreedCollector
 from src.data.fred_collector import FREDCollector
 from src.data.finnhub_collector import FinnhubCollector
@@ -193,9 +191,7 @@ class Orchestrator:
         self.news = NewsCollector()
         self.rss = RSSCollector()
         self.stocktwits = StocktwitsCollector()
-        self.trends = TrendsCollector()
         self.coingecko = CoinGeckoCollector()
-        self.metaculus = MetaculusCollector()
         self.fear_greed = FearGreedCollector()
         self.fred = FREDCollector()
         self.finnhub = FinnhubCollector()
@@ -211,6 +207,10 @@ class Orchestrator:
         self._scanner_running = False
         self._take_profit_hits: dict[str, int] = defaultdict(int)
         self._last_prune_time: float = 0.0
+
+        # Full wallet reconciliation — runs every 5 cycles
+        self._cycle_count: int = 0
+        self._wallet_reconcile_interval: int = 5
 
         # Build the LangGraph workflow
         self.graph = self._build_graph()
@@ -946,6 +946,15 @@ class Orchestrator:
         if not pending_sells:
             return
 
+        # Fetch all open orders once so we can cancel stale SELL limits.
+        open_orders = self.client.get_open_orders() or []
+        open_order_by_token: dict[str, str] = {}
+        for o in open_orders:
+            tid = o.get("asset_id") or o.get("token_id", "")
+            oid = o.get("id") or o.get("order_id", "")
+            if tid and oid:
+                open_order_by_token[tid] = oid
+
         for trade in pending_sells:
             market_id = trade["market_id"]
             token_id = trade["token_id"]
@@ -955,6 +964,49 @@ class Orchestrator:
                 continue  # CLOB API error — recheck next cycle
 
             if balance >= 1:
+                # Partial fill detection: if CLOB balance < tracked shares, some
+                # shares were sold. Correct downward so the next SELL order uses
+                # the real remaining quantity.
+                pos = self.portfolio.positions.get(market_id)
+                if pos and pos.shares > balance + 0.5:
+                    clob_shares = math.floor(balance)
+                    logger.warning(
+                        "PARTIAL FILL detected for '%s' — tracked=%d, CLOB balance=%.4f → correcting to %d shares",
+                        pos.question[:50], int(pos.shares), balance, clob_shares,
+                    )
+                    with self.portfolio._lock:
+                        current = self.portfolio.positions.get(market_id)
+                        if current is not None:
+                            current.shares = float(clob_shares)
+
+                # Tokens still held — check if our GTC SELL limit is stale.
+                # TAKE_PROFIT: cancel and re-place at midpoint (better price, patient).
+                # STOP_LOSS:   cancel and re-place at bid (speed over price).
+                # Trigger when limit is more than $0.05 above current midpoint.
+                pos = self.portfolio.positions.get(market_id)
+                if pos and pos.sell_price > 0:
+                    midpoint = self.client.get_midpoint(token_id)
+                    if midpoint is not None and pos.sell_price > midpoint + 0.05:
+                        clob_order_id = open_order_by_token.get(token_id)
+                        if clob_order_id:
+                            cancelled = self.client.cancel_order(clob_order_id)
+                            if cancelled:
+                                sell_reason = pos.selling_reason or "TAKE_PROFIT"
+                                logger.info(
+                                    "SELL LIMIT STALE: cancelled order for '%s' "
+                                    "(limit=$%.3f >> market=$%.3f) — re-firing at %s",
+                                    pos.question[:40], pos.sell_price, midpoint,
+                                    "bid" if sell_reason == "STOP_LOSS" else "midpoint",
+                                )
+                                # Release claim so the next hourly cycle or scanner
+                                # re-triggers the exit at the appropriate price.
+                                with self.portfolio._lock:
+                                    current = self.portfolio.positions.get(market_id)
+                                    if current is not None:
+                                        current.selling_pending = False
+                                        current.sell_price = 0.0
+                                        current.selling_reason = ""
+                                asyncio.run(mark_trade_status(trade["id"], "cancelled"))
                 continue  # Tokens still held — order not yet fully filled
 
             # Tokens are gone: SELL filled. Close the position.
@@ -1028,6 +1080,22 @@ class Orchestrator:
             if balance is None:
                 continue  # API error — recheck next cycle
             if balance >= 1:
+                # Tokens still held — check whether a SELL order is actually live.
+                # If not, selling_pending is a ghost (order never placed or failed
+                # silently before BUG-033 was fixed) — clear it so the exit check
+                # can re-evaluate the position next cycle.
+                if pos.token_id not in open_token_ids:
+                    logger.warning(
+                        "Ghost selling_pending detected for '%s' — tokens held but no "
+                        "open SELL order on CLOB. Clearing flag so exit can re-fire.",
+                        pos.question[:50],
+                    )
+                    with self.portfolio._lock:
+                        current = self.portfolio.positions.get(market_id)
+                        if current is not None:
+                            current.selling_pending = False
+                            current.sell_price = 0.0
+                            current.selling_reason = ""
                 continue  # Tokens still held — sell not yet filled
             if pos.token_id in open_token_ids:
                 continue  # Open order still live — waiting for fill
@@ -1105,9 +1173,121 @@ class Orchestrator:
                     trade["price"], midpoint,
                 )
 
+    def _reconcile_full_wallet(self) -> None:
+        """Full wallet reconciliation — runs every N cycles.
+
+        Fetches every token position held in the wallet from Polymarket's data
+        API and compares against tracked portfolio positions. Fixes three classes
+        of desync that the per-position reconcilers miss:
+
+          1. Unknown tokens (position in wallet, not in portfolio) → add
+          2. Balance lower than tracked (partial SELL fill)        → correct shares
+          3. Zero-balance positions still tracked (zombie)         → purge
+
+        This is expensive (one HTTP call + one Gamma lookup per unknown token)
+        so it runs every _wallet_reconcile_interval cycles, not every cycle.
+        """
+        if self.executor.paper_mode:
+            return
+
+        wallet_address = self.client.clob.get_address()
+        wallet_positions = self.client.get_wallet_positions(wallet_address)
+        if wallet_positions is None:
+            logger.warning("WALLET RECONCILE: data API unavailable — skipping")
+            return
+
+        # Build a map from token_id → wallet position
+        wallet_by_token: dict[str, dict] = {p["token_id"]: p for p in wallet_positions}
+
+        # --- Pass 1: check tracked positions against wallet ---
+        for market_id, pos in list(self.portfolio.positions.items()):
+            wallet_pos = wallet_by_token.get(pos.token_id)
+
+            if wallet_pos is None or wallet_pos["shares"] < 0.5:
+                # Wallet shows nothing — zombie position
+                logger.warning(
+                    "WALLET RECONCILE: '%s' has no wallet balance — purging zombie",
+                    pos.question[:50],
+                )
+                with self.portfolio._lock:
+                    self.portfolio.positions.pop(market_id, None)
+                continue
+
+            wallet_shares = wallet_pos["shares"]
+            if pos.shares > wallet_shares + 0.5:
+                # Tracked more than we actually hold (partial SELL fill)
+                import math
+                corrected = math.floor(wallet_shares)
+                logger.warning(
+                    "WALLET RECONCILE: '%s' tracked=%.2f wallet=%.2f — correcting to %d shares",
+                    pos.question[:50], pos.shares, wallet_shares, corrected,
+                )
+                with self.portfolio._lock:
+                    current = self.portfolio.positions.get(market_id)
+                    if current is not None:
+                        current.shares = float(corrected)
+
+        # --- Pass 2: find wallet tokens not tracked at all ---
+        tracked_tokens = {pos.token_id for pos in self.portfolio.positions.values()}
+        for token_id, wp in wallet_by_token.items():
+            if token_id in tracked_tokens:
+                continue
+            if wp["shares"] < 0.5:
+                continue
+
+            # Unknown token — look up market and add position
+            question = wp["question"]
+            market_id = wp["market_id"]
+            side = wp["side"]
+            avg_price = wp["avg_price"]
+            current_price = wp["current_price"]
+
+            logger.warning(
+                "WALLET RECONCILE: untracked token found — '%s' %.2f %s shares @ $%.3f — adding",
+                question[:50], wp["shares"], side, avg_price,
+            )
+
+            # Verify live midpoint before restoring (skip resolved markets)
+            midpoint = self.client.get_midpoint(token_id)
+            if midpoint is None:
+                logger.warning(
+                    "WALLET RECONCILE: skipping '%s' — no orderbook (market likely resolved)",
+                    question[:45],
+                )
+                continue
+
+            import math
+            restored = self.portfolio.restore_position(
+                market_id=market_id,
+                token_id=token_id,
+                question=question,
+                side=side,
+                shares=math.floor(wp["shares"]),
+                price=avg_price,
+                estimated_prob=0.0,
+            )
+            if restored:
+                self.portfolio.positions[market_id].current_price = midpoint or current_price
+                logger.info(
+                    "WALLET RECONCILE: restored '%s' — %d %s shares @ $%.3f",
+                    question[:45], math.floor(wp["shares"]), side, avg_price,
+                )
+
+        logger.info(
+            "WALLET RECONCILE complete — wallet=%d positions, tracked=%d positions",
+            len([p for p in wallet_positions if p["shares"] >= 0.5]),
+            len(self.portfolio.positions),
+        )
+
     def _monitor_positions(self, state: AgentState) -> dict:
         """Node 6: Check existing positions, auto-exit when thresholds hit."""
         logger.info("── Step 6: Monitoring positions ──")
+
+        # Full wallet reconciliation every N cycles
+        self._cycle_count += 1
+        if self._cycle_count % self._wallet_reconcile_interval == 0:
+            logger.info("── Full wallet reconciliation (cycle %d) ──", self._cycle_count)
+            self._reconcile_full_wallet()
 
         # Detect GTC orders that filled since last cycle
         self._reconcile_gtc_orders()
@@ -1252,11 +1432,30 @@ class Orchestrator:
             )
             self.portfolio.purge_position(market_id)
         else:
-            logger.warning(
-                "EXIT failed for '%s' — CLOB balance=%.2f (real tokens, "
-                "SELL rejected e.g. size below minimum). Keeping position.",
-                pos.question[:40], balance,
-            )
+            # Real tokens held — SELL was rejected (e.g. size mismatch, allowance).
+            # Correct tracked shares to match CLOB balance so the next exit attempt
+            # uses the right amount, then release the claim so the next cycle retries.
+            import math
+            clob_shares = math.floor(balance)
+            with self.portfolio._lock:
+                current = self.portfolio.positions.get(market_id)
+                if current is not None:
+                    # If tracked shares > CLOB balance, correct downward so the
+                    # next SELL uses a whole-number amount we actually hold.
+                    if current.shares > balance + 0.01:
+                        logger.warning(
+                            "EXIT failed for '%s' — tracked=%.4f > CLOB balance=%.4f, "
+                            "correcting shares to %d",
+                            pos.question[:40], current.shares, balance, clob_shares,
+                        )
+                        current.shares = float(clob_shares)
+                    else:
+                        logger.warning(
+                            "EXIT failed for '%s' — CLOB balance=%.4f (real tokens, "
+                            "SELL rejected — unknown reason). Keeping position.",
+                            pos.question[:40], balance,
+                        )
+                    current.selling_pending = False
 
     def _sync_cash_from_clob(self) -> None:
         """Pull real USDC balance from CLOB and correct portfolio cash.

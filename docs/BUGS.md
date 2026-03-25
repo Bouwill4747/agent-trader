@@ -319,16 +319,52 @@
 - **Fix**: Wrapped the peak update and drawdown calculation inside `with self._lock:`.
 - **Lesson Learned**: Properties that mutate state are fragile under concurrent access. If a `@property` has side effects, it needs the same thread protection as any other mutation. When in doubt about GIL safety for compound operations, use the lock.
 
+### BUG-038: Ghost `selling_pending` survives restart — position locked indefinitely after BUG-033
+- **Date**: 2026-03-15
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: Medium
+- **Symptom**: Taylor Swift NO position showed `[SELLING]` for multiple cycles with no SELL trade in the DB and `sell_price=0.0`. No SELL order was ever placed on the CLOB. The exit check skipped the position every cycle, and no reconciler cleared it. Unrealized gains were locked and could not be realised.
+- **Root Cause**: BUG-033 fixed the runtime path (claim released on failure), but did not fix positions that were already stuck in the broken state before that fix was deployed. On restart, `load_from_db()` restored the snapshot with `selling_pending=True, sell_price=0.0, selling_reason=""` — a ghost state where the claim flag is set but no actual SELL order exists on the CLOB and no pending SELL trade exists in the DB. `_reconcile_sell_orders()` requires a pending SELL trade in the DB to act; `_close_orphaned_sells()` saw `balance >= 1` (tokens still held) and continued past the position without checking whether an order was actually live.
+- **Fix**: Added a ghost-detection branch inside `_close_orphaned_sells()` for the live-mode path. When `balance >= 1` (tokens still held) AND the token is not in `open_token_ids` (no live SELL order on the CLOB), the position is in a ghost state — the flag is cleared under the portfolio lock and a warning is logged, allowing the exit check to re-evaluate and re-fire the SELL on the next cycle.
+- **Lesson Learned**: A bug fix that corrects a runtime code path does not automatically heal positions that entered the broken state before the fix was deployed. Persisted state (DB snapshots) carries forward the old corruption. Reconcilers need to handle not just "order filled but portfolio not updated" but also "flag set but no order ever placed". Any time a claim flag is added, define what a valid claimed state looks like and add a sanity check that detects and recovers from invalid ones.
+
+### BUG-039: Hourly monitor doesn't clear `selling_pending` on failed SELL — same ghost as BUG-033/038
+- **Date**: 2026-03-15
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: High
+- **Symptom**: After BUG-038 was fixed (ghost cleared, exit re-fired), the hourly cycle immediately re-set `selling_pending=True` and attempted a SELL. The SELL failed with CLOB error `not enough balance / allowance` (tracked shares=17, actual CLOB balance=16.96). `_purge_if_balance_zero()` correctly kept the position (tokens are real) but returned without clearing `selling_pending`. Position stuck in ghost state again — same symptom as BUG-038, one cycle later.
+- **Root Cause**: Two problems in the hourly `_monitor_positions` path: (1) `selling_pending = True` is set at line 1199 before `execute_exit()`, but `_purge_if_balance_zero()` — called when the SELL fails — only handled the phantom case (`balance < 1`) and the "keep and log" case (`balance >= 1`) without clearing the flag on the keep path. (2) Tracked `pos.shares` (17) was greater than actual CLOB balance (16.96), causing the CLOB to reject the sell with `not enough balance`. The share count discrepancy likely originates from fee deductions or rounding on the original GTC BUY fill.
+- **Fix**: In `_purge_if_balance_zero`, when `balance >= 1` (keep path): (a) correct `pos.shares` to `math.floor(balance)` if it differs from the tracked count, (b) always clear `selling_pending = False` under the portfolio lock so the next cycle can retry with the corrected share count.
+- **Lesson Learned**: The `selling_pending` claim flag must be released on every failure path in every code path that sets it — scanner, hourly cycle, and any future paths. `_purge_if_balance_zero` is a shared failure handler but was missing the flag release. Also: CLOB fills may return fractional or slightly fewer shares than ordered (fees, rounding). Tracked share counts should be reconciled against CLOB balance before placing exit orders, not just at purge time.
+
+### BUG-040: Partial SELL fills not detected — tracked shares never corrected
+- **Date**: 2026-03-17
+- **File(s)**: `src/agent/orchestrator.py`
+- **Severity**: High
+- **Symptom**: Taylor Swift NO position tracked 15 shares internally, but Polymarket UI showed only 1 share on-chain. The agent continued placing SELL orders for 15 shares (all rejected or ignored) while 14 shares had already been sold via partial fills of the GTC limit order. Unrealized PnL and share count were both wrong.
+- **Root Cause**: `_reconcile_sell_orders()` handles two cases: `balance < 1` (order fully filled → close position) and `balance >= 1` (tokens still held → keep waiting). The `balance >= 1` branch never checked whether the balance had dropped below the tracked share count. Partial fills reduce the on-chain balance without triggering a full close, so the tracked `pos.shares` drifted away from reality indefinitely. The stale-order cancel/re-place loop kept firing for the original quantity.
+- **Fix**: Added partial fill detection at the top of the `balance >= 1` branch in `_reconcile_sell_orders()`. If `pos.shares > balance + 0.5`, log `PARTIAL FILL detected` and correct `pos.shares` to `math.floor(balance)` under the portfolio lock. The next SELL order will be placed for the corrected (real) quantity.
+- **Lesson Learned**: GTC limit orders can partially fill over time — buyers absorb some shares but not all. Any reconciler that only distinguishes "fully filled" vs "not filled" will miss this. Always compare tracked quantity to actual on-chain balance, not just whether balance crossed zero.
+
+### BUG-041: No full wallet reconciliation — portfolio drifts from on-chain reality
+- **Date**: 2026-03-25
+- **File(s)**: `src/agent/orchestrator.py`, `src/data/polymarket_client.py`
+- **Severity**: High
+- **Symptom**: Portfolio showed 9 positions but Polymarket wallet had 9 different positions — share counts wrong across all positions, SpaceX had 5 shares sold but agent tracked 10, Amy Klobuchar position (46.7 shares) completely untracked, Ilhan Omar (zombie) still shown after tokens were gone, Silver $95 closed but still tracked. Required manual DB surgery to resync.
+- **Root Cause**: All existing reconcilers (`_reconcile_sell_orders`, `_close_orphaned_sells`, `_reconcile_missing_positions`) only operate on positions the agent **already knows about**. They compare known positions against CLOB state, not the other way around. A position that appears or disappears outside the normal BUY/SELL flow (manual trade, cancelled GTC with partial fill, market resolution) is invisible to all reconcilers. No mechanism started from the wallet and worked backwards to the portfolio.
+- **Fix**: Added `_reconcile_full_wallet()` that calls `data-api.polymarket.com/positions` every 5 cycles to fetch all wallet token holdings. Compares against tracked positions and: (1) purges zombies with no wallet balance, (2) corrects share counts where wallet < tracked (partial fills), (3) adds untracked positions found in wallet. Added `get_wallet_positions()` to `PolymarketClient` and `get_market_id_for_token()` for Gamma lookup. Added `_cycle_count` counter to orchestrator.
+- **Lesson Learned**: Event-driven tracking ("track what I did") always drifts from truth. Periodically verify state against ground truth (the actual wallet). The wallet is always right. Build reconcilers that start from the wallet, not from internal state.
+
 ---
 
 ## Stats
 
 | Metric | Count |
 |--------|-------|
-| Total bugs | 37 |
+| Total bugs | 41 |
 | Critical | 10 |
-| High | 15 |
-| Medium | 9 |
+| High | 18 |
+| Medium | 10 |
 | Low | 3 |
 
 ### BUG-027: Drawdown check uses stale cash — HALTED not triggering

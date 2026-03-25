@@ -315,19 +315,24 @@ class PolymarketClient:
             logger.error("Midpoint parse error for %s: %s", token_id, e)
             return None
 
-    def get_price(self, token_id: str) -> dict | None:
-        """Get current best bid and ask prices."""
+    def get_best_bid(self, token_id: str) -> float | None:
+        """Get the current best bid price (what buyers will pay).
+
+        Used for SELL orders — placing at the bid guarantees immediate fill.
+        The CLOB get_price(side='buy') returns the highest bid.
+        """
         if not self.clob:
             return None
         try:
             self.clob_limiter.wait()
-            price = self.clob.get_price(token_id)
-            return price
+            result = self.clob.get_price(token_id, "buy")
+            price = result.get("price") if isinstance(result, dict) else result
+            return float(price) if price else None
         except (ConnectionError, TimeoutError, OSError) as e:
-            logger.error("Price connection error for %s: %s", token_id, type(e).__name__)
+            logger.error("Best bid connection error for %s: %s", token_id, type(e).__name__)
             return None
-        except (ValueError, KeyError) as e:
-            logger.error("Price parse error for %s: %s", token_id, e)
+        except (ValueError, KeyError, TypeError) as e:
+            logger.error("Best bid parse error for %s: %s", token_id, e)
             return None
 
     # ──────────────────────────────────────────────
@@ -525,6 +530,81 @@ class PolymarketClient:
         except (ValueError, KeyError) as e:
             logger.error("Fetch orders parse error: %s", e)
             return None
+
+    def get_wallet_positions(self, wallet_address: str) -> list[dict] | None:
+        """Fetch all token positions held by the wallet from Polymarket's data API.
+
+        Returns a list of position dicts with keys:
+          token_id, market_id, question, side, shares, avg_price, current_price
+
+        Only returns positions with size >= 0.5 (filters dust).
+        Returns None on API error.
+        """
+        try:
+            resp = httpx.get(
+                "https://data-api.polymarket.com/positions",
+                params={"user": wallet_address, "sizeThreshold": "0.5"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            raw = resp.json()
+            if not isinstance(raw, list):
+                logger.error("Wallet positions API returned non-list: %s", type(raw).__name__)
+                return None
+
+            positions = []
+            for item in raw:
+                token_id = str(item.get("asset", ""))
+                if not token_id:
+                    continue
+
+                # Look up Gamma market_id from token_id
+                market_id = None
+                try:
+                    self.gamma_limiter.wait()
+                    mkt_resp = self.gamma.get("/markets", params={"clob_token_ids": token_id})
+                    mkt_resp.raise_for_status()
+                    mkt_data = mkt_resp.json()
+                    if mkt_data and isinstance(mkt_data, list):
+                        market_id = str(mkt_data[0].get("id", ""))
+                except Exception:
+                    pass
+
+                if not market_id:
+                    # Fall back to using token_id as the key
+                    market_id = token_id[:12]
+
+                side = "YES" if item.get("outcome", "").lower() == "yes" else "NO"
+                positions.append({
+                    "token_id":     token_id,
+                    "market_id":    market_id,
+                    "question":     item.get("title", "Unknown market"),
+                    "side":         side,
+                    "shares":       float(item.get("size", 0)),
+                    "avg_price":    float(item.get("avgPrice", 0)),
+                    "current_price": float(item.get("curPrice", 0)),
+                })
+
+            return positions
+        except httpx.HTTPStatusError as e:
+            logger.error("Wallet positions API HTTP %d: %s", e.response.status_code, e)
+            return None
+        except Exception as e:
+            logger.error("Wallet positions API error: %s", e)
+            return None
+
+    def get_market_id_for_token(self, token_id: str) -> str | None:
+        """Look up Gamma market_id for a given token_id."""
+        try:
+            self.gamma_limiter.wait()
+            resp = self.gamma.get("/markets", params={"clob_token_ids": token_id})
+            resp.raise_for_status()
+            data = resp.json()
+            if data and isinstance(data, list):
+                return str(data[0].get("id", ""))
+        except Exception:
+            pass
+        return None
 
     # ──────────────────────────────────────────────
     # Cleanup
